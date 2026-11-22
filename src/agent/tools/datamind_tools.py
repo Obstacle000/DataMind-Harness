@@ -26,7 +26,7 @@ from ..runtime_context import get_current_user_id
 
 
 @tool
-def inspect_schema_map(query: str, top_k: int = 5) -> str:
+def inspect_schema_map(query: str, top_k: int = 5, force_refresh: bool = False) -> str:
     """检索企业数仓的表血缘骨架图（Schema-Map via Table-Rank）。
 
     在编写任何多表 JOIN SQL 之前**必须先调用本工具**！
@@ -36,12 +36,15 @@ def inspect_schema_map(query: str, top_k: int = 5) -> str:
     Args:
         query: 自然语言分析意图或关键词（例如："华东客户退货率与供应商关联分析"）
         top_k: 返回的核心表数量，默认 5
+        force_refresh: 是否强制穿透 Redis 缓存重新从数据库拉取最新表结构并对账，默认 False
 
     Returns:
         包含 TableRank 权重排名、字段详情及最短 JOIN ON 连接路径的 Markdown 说明。
     """
     result = schema_map_engine.build_schema_map_prompt(
-        query=query, top_k=max(2, min(int(top_k or 5), 10))
+        query=query,
+        top_k=max(2, min(int(top_k or 5), 10)),
+        force_refresh=bool(force_refresh),
     )
     return result["schema_map_markdown"]
 
@@ -70,6 +73,12 @@ def execute_readonly_sql(sql: str, limit: int = 200) -> str:
         redis_client.set_sql_cache(sql, result, engine="pg")
         # 运行时自学习：将成功执行的 SQL 中的 JOIN 关系动态沉淀到 Schema-Map 血缘图谱
         schema_map_engine.learn_from_executed_sql(sql)
+    elif schema_map_engine.handle_sql_schema_error(str(result.get("error", ""))):
+        result["schema_cache_refreshed"] = True
+        result["recovery_hint"] = (
+            "检测到数据库表结构已发生变更，系统已自动击穿 Redis 旧缓存并同步更新了 Schema-Map 与 schema_lineage.yaml。"
+            "请重新调用 inspect_schema_map 获取最新字段名后重试。"
+        )
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -96,6 +105,12 @@ def query_duckdb_olap(sql: str, limit: int = 500) -> str:
     if not result.get("error"):
         redis_client.set_sql_cache(sql, result, engine="duckdb")
         schema_map_engine.learn_from_executed_sql(sql)
+    elif schema_map_engine.handle_sql_schema_error(str(result.get("error", ""))):
+        result["schema_cache_refreshed"] = True
+        result["recovery_hint"] = (
+            "检测到数据库表结构已发生变更，系统已自动击穿 Redis 旧缓存并同步更新了 Schema-Map 与 schema_lineage.yaml。"
+            "请重新调用 inspect_schema_map 获取最新字段名后重试。"
+        )
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 

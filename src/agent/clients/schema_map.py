@@ -1,27 +1,69 @@
 """
-Schema-Map 数仓血缘图谱与 Table-Rank 引擎（两阶段工业级架构）
+Schema-Map 数仓血缘图谱与 Table-Rank 引擎
 
 ================================================================================
-【第一阶段：离线/启动建图期 (Phase 1: 3-Layer Lineage Discovery Funnel)】
-在任何用户提问之前，通过三层探边漏斗一次性找齐所有表的关联边，严格按四元组去重后落盘至 `schema_lineage.yaml`：
-  - 第 1 层（物理外键 `physical_fk`）：直接读取数据库 `information_schema` 的物理 FOREIGN KEY；
-  - 第 2 层（历史 SQL AST 挖掘 `sql_ast_mined`）：用 SQLGlot 解析历史 SQL 种子库，还原表别名提取 JOIN ON；
-  - 第 3 层（隐藏外键探查 `inclusion_llm_verified` —— 解决无外键、无历史SQL、异名字段的孤岛表）：
-      Step 3.1 锁定全库各表的主键靶子 (Primary Key Targets)；
-      Step 3.2 算法算“数据值集合包含率 (Inclusion Dependency Ratio ≥ 80%)”，筛掉 99% 值域不匹配的列与低基数维度列；
-      Step 3.3 大模型语义二分类盖章（防 `1,2,3` 自增 ID 巧合碰撞，判断表名+字段名+注释在业务上是否真属于主外键）；
-      Step 3.4 按规范化四元组 `(left_table, left_col, right_table, right_col)` 严格去重，持久化写回 `schema_lineage.yaml`！
-
-【第二阶段：在线用户查询期 (Phase 2: Online PageRank + Shortest Path)】
-图在第一阶段已 100% 建好边，用户提问时 **0 大模型探边开销**：
-  1. 在加权血缘图上运行个性化 PageRank (Table-Rank) 选出 Top-K 核心表（自动拉入中间枢纽桥梁表）；
-  2. 运行 BFS 最短路径输出显式 `JOIN ON` 连接路径，大模型直接照抄标准答案，无需看样本二次猜外键！
+调用 build_schema_map_prompt(query)
+  │
+  ├─► 第 1 步：拿表结构 (self._schema)
+  │     先查 Redis 缓存；没命中再去 PostgreSQL 查出所有表名、字段名、物理外键。
+  │     （若运行期 SQL 报字段/表不存在，handle_sql_schema_error 会自动 force_refresh=True 击穿脏缓存）
+  │
+  ├─► 第 2 步：算表结构 MD5 指纹，决定要不要跑“第一阶段探边与对账”
+  │     ├─ 指纹没变 ──> 0ms 直接跳过第 3 步！（复用内存里现成的 self._relationships）
+  │     └─ 指纹变了（或首次启动）──> 进入第 3 步
+  │
+  ├─► 第 3 步：【第一阶段】三步对账 + 三层漏斗找齐所有外键边 (self._relationships) 并落盘 YAML
+  │     ① 剪枝死边 (_prune_stale_relationships)：读 schema_lineage.yaml 旧记录，踢掉在最新表结构里已被删/改名的死边；
+  │     ② 合入第 1 层（物理外键）+ 第 2 层（SQLGlot 解析历史 SQL 里的 JOIN ON，自动校验字段存活）；
+  │     ③ 合入第 3 层（对没外键的孤岛表算“数据值包含率 ≥ 80%” + 语义域/大模型二分类盖章）；
+  │     ④ 按规范化四元组 (左表, 左列, 右表, 右列) 严格去重后，原子覆写回 schema_lineage.yaml。
+  │
+  ├─► 第 4 步：【第二阶段】把四元组变成“无向加权图” (_build_adjacency)
+  │     遍历 self._relationships，组装出：
+  │     - 邻接表 adj（哪张表和哪张表相连）
+  │     - 边条件 edge_join_conditions（相连的两张表用哪些字段 ON，复合键自动用 AND 拼接）
+  │     - 边权重 edge_weights（验证次数越多、复合键越具体，边权重越高）
+  │
+  ├─► 第 5 步：【第二阶段】跑个性化 PageRank 选出 Top-K 核心表 (compute_table_rank)
+  │     ① 看用户的 query 命中了哪几张表（如“客户”“退货”），给它们加高初始偏置权重；
+  │     ② 顺着第 4 步的无向加权图跑 PageRank 概率游走（把中间的枢纽表“订单表”也顶上来）；
+  │     ③ 按得分从高到低排序，截取前 K 张表（selected = Top-K）。
+  │
+  └─► 第 6 步：【第二阶段】连通补桥 + 主干/备选双栏划分 (resolve_connected_subgraph)
+        ① 迭代 BFS 连通补桥：检查选中表集合内部是否存在孤岛（多个连通分量）；
+           若断开，在全库大图上跑多源 BFS 找到最短路径，把路径上的中间桥表（支持多跳桥）并入集合，
+           反复迭代直到集合内所有可达表完全连通，并将补进来的桥表字段同步补充到上方表清单！
+        ② 带权最大生成树（MST）分两栏输出（既不丢边，又防三角形环路）：
+           收集补桥后集合内的全部关联边，按权重从高到低用并查集（Kruskal）划分为两栏：
+           - 第一栏【🌲 默认主干连法】：N 张表选出权重最高的 N-1 条无环生成树主干边，直接连通所有表；
+           - 第二栏【🔄 备选替换连法】：其余会形成三角形/环路的边（如明细级复合键边）绝不丢弃，
+             放入备选栏并提示大模型“按需替换主干，严禁同时堆叠形成环形重复 JOIN”！
 ================================================================================
 """
+# 为什么第 6 步要做成「迭代 BFS 补桥 + 主干/备选两栏分治」？
+# 1. 为什么不能只补“一座桥”？（防多跳断桥）
+#   如果选出的 Top-5 里有 A、B、C 三个孤岛，或者 A 和 B 之间隔了 X -> Y 两跳桥（它们刚好排在第 6、7 名落选了），
+#   单次找一座桥会漏掉多跳。因此必须用 while 循环检查连通分量 (_get_components)，反复在全图跑多源 BFS，
+#   直到选中集合内部变成 1 个完整的连通分量（或者确认某张表在全库里本来就是真·孤立表）。
+# 2. 为什么不能“简单砍掉环路第 3 条边”，也不能“不加区分全丢给大模型”？
+#   假设关联关系是一个三角形环路：
+#         订单表 (fact_orders)
+#         /            \
+#        /              \
+# 订单明细表 ────────── 退货表 (fact_returns)
+#   - 如果用单起点 BFS 硬砍掉第 3 条边（比如砍掉 订单明细表 ── 退货表）：
+#     当业务刚好需要按“商品明细粒度（order_id AND product_id）”查退货时，大模型看不到这条边，只能绕道订单表按 order_id 连，引发数据扇出放大 Bug！
+#   - 如果把 3 条边混在一起全丢给大模型：
+#     大模型会老老实实把 3 条边全写进同一条 SQL，导致 3 张表连 3 次绕成死圈。
+#   - 终极解法（像手机导航一样分「主路线」与「备选替换路线」两栏）：
+#     用并查集按权重选出 N-1 条无环边放进【1. 默认主干连法】，把剩下的环路边放进【2. 备选替换连法】，
+#     既保证了关键细粒度边 100% 不丢失，又通过显式分栏+防环警告阻止大模型把三角形的 3 条边同时写进一条 SQL！
 from __future__ import annotations
 
 from collections import deque
 from datetime import datetime
+import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -55,10 +97,44 @@ class SchemaMapEngine:
     def __init__(self, lineage_path: Path = LINEAGE_YAML_PATH):
         self.lineage_path = lineage_path
         self._lock = threading.RLock()
+        # "fact_quality_claims": {
+        #         "description": "供应商质量索赔孤岛表（无物理外键、无历史SQL、字段异名：ord_ref_no / vendor_code）",
+        #         "primary_key": "claim_id",
+        #         "columns": [
+        #             {"name": "claim_id",     "type": "BIGINT",        "comment": "索赔单唯一主键"},
+        #             {"name": "ord_ref_no",   "type": "BIGINT",        "comment": "关联业务订单号（异名外键，未建物理约束）"},
+        #             {"name": "vendor_code",  "type": "BIGINT",        "comment": "责任供应商编码（异名外键，未建物理约束）"},
+        #             {"name": "claim_region", "type": "VARCHAR(32)",   "comment": "发生大区（低基数维度列）"},
+        #             {"name": "claim_amount", "type": "NUMERIC(14,2)", "comment": "质量索赔扣款金额"},
+        #             {"name": "claim_status", "type": "VARCHAR(32)",   "comment": "索赔状态"},
+        #         ],
+        #         "foreign_keys": [],  # <-- 注意：这里物理外键是空的！靠第一阶段探出来后存进 self._relationships
+        #     }
         self._schema: Dict[str, Dict[str, Any]] = {}
         # 严格按规范化四元组唯一去重: (left_table, left_col, right_table, right_col) -> dict
+        # ("dim_customers", "customer_id", "fact_orders", "customer_id"): {
+        #         "left_table": "dim_customers",
+        #         "left_col": "customer_id",
+        #         "right_table": "fact_orders",
+        #         "right_col": "customer_id",
+        #         "source": "semantic_layer",
+        #         "verified_count": 7,
+        #         "inclusion_ratio": 1.0,
+        #         "last_verified_at": "2026-11-22T15:33:19",
+        #     }
         self._relationships: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
-        self._bootstrapped = False
+        # 表结构 MD5 指纹（替代死板的 bool 开关）：表结构未变时 0ms 跳过第一阶段；表结构一旦改变，指纹不一致自动触发三步对账更新
+        self._bootstrapped_schema_hash: str = ""
+        self._yaml_loaded_once: bool = False
+
+    @staticmethod
+    def _compute_schema_hash(schema: Dict[str, Dict[str, Any]]) -> str:
+        """计算当前数仓表结构（表名 + 字段名 + 字段类型 + 物理外键）的 MD5 指纹"""
+        try:
+            payload = json.dumps(schema, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            payload = str(sorted(schema.keys()))
+        return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
     # ============================================================
     # 规范化四元组去重器 (Canonical 4-Tuple Deduplication)
@@ -140,21 +216,68 @@ class SchemaMapEngine:
     def load_schema(self, force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
         with self._lock:
             if not force_refresh:
+                # 1. 先看 Redis 缓存里有没有存好的表结构
                 cached = redis_client.get_schema_graph_cache("warehouse_v1")
                 if cached:
                     self._schema = cached
                     self._run_phase1_discovery_funnel()
                     return self._schema
+            # 2. 缓存没命中（或已过期），才真正连 PostgreSQL 查 information_schema 系统表
             self._schema = postgres_client.fetch_schema_metadata()
+            # 3. 查出来后存进 Redis，默认缓存 1800 秒（30 分钟）
             redis_client.set_schema_graph_cache(self._schema, "warehouse_v1")
-            self._run_phase1_discovery_funnel()
+            self._run_phase1_discovery_funnel(force_reconcile=force_refresh)
             return self._schema
 
-    def _run_phase1_discovery_funnel(self) -> None:
-        """执行第一阶段三层探边漏斗，确保所有表（含无外键孤岛表）的关联边一次性探清并去重落盘"""
-        if self._bootstrapped and self._relationships:
+    def _prune_stale_relationships(self) -> int:
+        """对账第 1 步：剪枝死边（剔除最新表结构中已被删除/改名的表、列或已移除的物理外键）"""
+        live_table_cols: Dict[str, Set[str]] = {
+            t_name: {c["name"] for c in meta.get("columns", [])}
+            for t_name, meta in self._schema.items()
+        }
+        live_physical_fks: Set[Tuple[str, str, str, str]] = set()
+        for t_name, meta in self._schema.items():
+            for fk in meta.get("foreign_keys", []):
+                live_physical_fks.add(
+                    self._canonical_4tuple(t_name, fk["column"], fk["ref_table"], fk["ref_column"])
+                )
+
+        stale_keys: List[Tuple[str, str, str, str]] = []
+        for key, rel in self._relationships.items():
+            lt, lc, rt, rc = key
+            # 1. 表或列在最新数据库中已不存在（被 DROP 或 RENAME）
+            if (
+                lt not in live_table_cols
+                or lc not in live_table_cols[lt]
+                or rt not in live_table_cols
+                or rc not in live_table_cols[rt]
+            ):
+                stale_keys.append(key)
+                continue
+            # 2. 原本是物理外键，但 DBA 在最新表结构中移除了该外键约束
+            if rel.get("source") == "physical_fk" and key not in live_physical_fks:
+                stale_keys.append(key)
+
+        for k in stale_keys:
+            self._relationships.pop(k, None)
+            agent_logger.info(f"Pruned stale lineage edge after schema change: {k}")
+
+        return len(stale_keys)
+
+    def _run_phase1_discovery_funnel(self, force_reconcile: bool = False) -> None:
+        """执行第一阶段三层探边漏斗 + 表结构变更三步对账（剪枝死边 -> 同步外键 -> 增量探新 -> 覆写 YAML）"""
+        if not self._schema:
             return
-        self._bootstrapped = True
+
+        current_hash = self._compute_schema_hash(self._schema)
+        if (
+            not force_reconcile
+            and current_hash == self._bootstrapped_schema_hash
+            and self._relationships
+        ):
+            return  # 表结构 MD5 指纹未变，0 毫秒直接放行！
+
+        self._bootstrapped_schema_hash = current_hash
 
         raw_data: Dict[str, Any] = {}
         if self.lineage_path.exists():
@@ -165,32 +288,38 @@ class SchemaMapEngine:
 
         dirty = False
 
-        # 0. 加载 schema_lineage.yaml 已持久化的语义层边（同时自动对历史脏数据做四元组去重）
-        rel_list = raw_data.get("relationships", []) or []
-        seen_in_file: Set[Tuple[str, str, str, str]] = set()
-        for item in rel_list:
-            if not isinstance(item, dict):
-                continue
-            lt = str(item.get("left_table", "")).strip()
-            lc = str(item.get("left_col", "")).strip()
-            rt = str(item.get("right_table", "")).strip()
-            rc = str(item.get("right_col", "")).strip()
-            if not (lt and lc and rt and rc) or lt == rt:
-                continue
-            key = self._canonical_4tuple(lt, lc, rt, rc)
-            if key in seen_in_file:
-                dirty = True  # 文件中存在重复四元组，标记稍后重写去重
-            seen_in_file.add(key)
-            self._upsert_edge_in_memory(
-                lt, lc, rt, rc,
-                source=str(item.get("source", "semantic_layer")),
-                verified_count=int(item.get("verified_count", 1)),
-                inclusion_ratio=float(item.get("inclusion_ratio", 1.0)),
-                last_verified_at=str(item.get("last_verified_at", "")),
-                increment_if_exists=False,
-            )
+        # 0. 首次从 schema_lineage.yaml 加载持久化关系（同时自动对文件做四元组去重）
+        if not self._yaml_loaded_once:
+            self._yaml_loaded_once = True
+            rel_list = raw_data.get("relationships", []) or []
+            seen_in_file: Set[Tuple[str, str, str, str]] = set()
+            for item in rel_list:
+                if not isinstance(item, dict):
+                    continue
+                lt = str(item.get("left_table", "")).strip()
+                lc = str(item.get("left_col", "")).strip()
+                rt = str(item.get("right_table", "")).strip()
+                rc = str(item.get("right_col", "")).strip()
+                if not (lt and lc and rt and rc) or lt == rt:
+                    continue
+                key = self._canonical_4tuple(lt, lc, rt, rc)
+                if key in seen_in_file:
+                    dirty = True
+                seen_in_file.add(key)
+                self._upsert_edge_in_memory(
+                    lt, lc, rt, rc,
+                    source=str(item.get("source", "semantic_layer")),
+                    verified_count=int(item.get("verified_count", 1)),
+                    inclusion_ratio=float(item.get("inclusion_ratio", 1.0)),
+                    last_verified_at=str(item.get("last_verified_at", "")),
+                    increment_if_exists=False,
+                )
 
-        # 第 1 层：直接合入数据库物理外键 (information_schema Physical FK)
+        # 对账第 1 步：【剪枝死边】拿着现有关系与最新表结构对账，踢掉已被删表/删列/改名的幽灵边
+        pruned_count = self._prune_stale_relationships()
+        dirty = dirty or (pruned_count > 0)
+
+        # 对账第 2 步：【合入最新物理外键 & 历史 SQL 边】
         for table_name, meta in self._schema.items():
             for fk in meta.get("foreign_keys", []):
                 added = self._upsert_edge_in_memory(
@@ -204,7 +333,6 @@ class SchemaMapEngine:
                 )
                 dirty = dirty or added
 
-        # 第 2 层：用 SQLGlot AST 解析历史 SQL 种子库 (golden_sql_seed)
         seed_sqls = raw_data.get("golden_sql_seed", []) or []
         if seed_sqls:
             mined_new = self.mine_join_edges_from_sql_history(
@@ -212,10 +340,11 @@ class SchemaMapEngine:
             )
             dirty = dirty or (mined_new > 0)
 
-        # 第 3 层：针对无外键、无历史 SQL 的孤岛表/未关联列，执行「数据值包含率初筛 + 大模型语义盖章」
+        # 对账第 3 步：【增量探测新表/改名新列】执行「数据值包含率初筛 + 大模型语义盖章」
         discovered_new = self.discover_hidden_foreign_keys(persist=False)
         dirty = dirty or (discovered_new > 0)
 
+        # 只要发生了死边剔除或新边发现，立即原子覆写更新 schema_lineage.yaml！
         if dirty:
             self._persist_lineage_to_yaml()
 
@@ -420,6 +549,10 @@ class SchemaMapEngine:
         with self._lock:
             schema = self._schema or postgres_client.fetch_schema_metadata()
             known_tables = set(schema.keys())
+            live_cols = {
+                t_name: {c["name"] for c in meta.get("columns", [])}
+                for t_name, meta in schema.items()
+            }
             changed_count = 0
 
             for sql in sql_list:
@@ -427,7 +560,13 @@ class SchemaMapEngine:
                     continue
                 edges = self._extract_joins_from_single_sql(sql, known_tables)
                 for t1, col1, t2, col2 in edges:
-                    if t1 == t2 or t1 not in known_tables or t2 not in known_tables:
+                    if (
+                        t1 == t2
+                        or t1 not in known_tables
+                        or t2 not in known_tables
+                        or col1 not in live_cols.get(t1, set())
+                        or col2 not in live_cols.get(t2, set())
+                    ):
                         continue
                     changed = self._upsert_edge_in_memory(
                         t1, col1, t2, col2,
@@ -614,86 +753,239 @@ class SchemaMapEngine:
 
         return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
-    def find_join_bridges(self, target_tables: List[str]) -> List[str]:
+    def resolve_connected_subgraph(self, target_tables: List[str]) -> Dict[str, Any]:
+        """两步连通子图与主干/备选边划分器：
+        第 1 步（迭代 BFS 连通补桥）：
+          检查选中表集合在诱导子图中的连通分量；若存在孤岛，在全库图上跑多源 BFS 找最短路径，
+          将路径上的中间桥表加入集合，反复迭代直到集合内任意两表连通（或确认全库不可达）。
+        第 2 步（带权最大生成树 MST 分栏输出）：
+          收集补桥后集合内的全部关联边（绝不砍边），按权重从高到低跑 Kruskal 生成树：
+          - 构成无环生成树的 N-1 条边归入 `backbone_edges`（默认主干连法）；
+          - 形成三角形/环路的其余边归入 `alternative_edges`（备选替换连法，带防环提示）。
+        """
         schema = self.load_schema()
-        adj, edge_conds, _ = self._build_adjacency(schema)
-        valid_targets = [t for t in target_tables if t in schema]
-        if len(valid_targets) < 2:
-            return []
+        adj, edge_conds, edge_weights = self._build_adjacency(schema)
+        ordered_tables: List[str] = []
+        for t in target_tables:
+            if t in schema and t not in ordered_tables:
+                ordered_tables.append(t)
 
-        join_clauses: List[str] = []
-        seen_table_pairs: Set[Tuple[str, str]] = set()
+        if len(ordered_tables) < 2:
+            return {
+                "final_tables": ordered_tables,
+                "bridge_tables": [],
+                "unreachable_tables": [],
+                "backbone_edges": [],
+                "alternative_edges": [],
+            }
 
-        def _bfs_path(start: str, goal: str) -> List[str]:
-            queue = deque([[start]])
-            visited = {start}
+        selected_set: Set[str] = set(ordered_tables)
+        bridge_tables: List[str] = []
+        unreachable_tables: Set[str] = set()
+
+        def _get_components(nodes: Set[str]) -> List[Set[str]]:
+            active = nodes - unreachable_tables
+            visited: Set[str] = set()
+            comps: List[Set[str]] = []
+            for n in ordered_tables:
+                if n not in active or n in visited:
+                    continue
+                comp: Set[str] = set()
+                q = deque([n])
+                visited.add(n)
+                while q:
+                    curr = q.popleft()
+                    comp.add(curr)
+                    for nb in adj.get(curr, ()):
+                        if nb in active and nb not in visited:
+                            visited.add(nb)
+                            q.append(nb)
+                comps.append(comp)
+            return comps
+
+        def _shortest_bridge_between(comp_a: Set[str], targets: Set[str]) -> List[str]:
+            """在全库大图上跑多源 BFS，找从 comp_a 到 targets 任意节点的最短路径"""
+            queue = deque([[start] for start in comp_a])
+            visited = set(comp_a)
             while queue:
                 path = queue.popleft()
-                node = path[-1]
-                if node == goal:
+                curr = path[-1]
+                if curr in targets:
                     return path
-                for nb in adj.get(node, ()):
+                for nb in adj.get(curr, ()):
                     if nb not in visited:
                         visited.add(nb)
                         queue.append(path + [nb])
             return []
 
-        anchor = valid_targets[0]
-        for other in valid_targets[1:]:
-            path = _bfs_path(anchor, other)
-            for i in range(len(path) - 1):
-                u, v = path[i], path[i + 1]
-                t_pair = (u, v) if u <= v else (v, u)
-                if t_pair not in seen_table_pairs:
-                    seen_table_pairs.add(t_pair)
-                    cond = edge_conds.get((u, v), f"{u}.id = {v}.id")
-                    matching_rels = [
-                        r for (lt, _, rt, _), r in self._relationships.items()
-                        if (lt, rt) == t_pair
-                    ]
-                    tag = ""
-                    if matching_rels:
-                        cnt = max(int(r.get("verified_count", 1)) for r in matching_rels)
-                        sources = sorted({str(r.get("source", "")) for r in matching_rels})
-                        tag = f" [已验证 {cnt} 次 | 来源: {'/'.join(sources)}]"
-                    join_clauses.append(f"`{u}` JOIN `{v}` ON `{cond}`{tag}")
+        # ============ 第 1 步：迭代 BFS 连通补桥 ============
+        while True:
+            comps = _get_components(selected_set)
+            if len(comps) <= 1:
+                break
+            main_comp = comps[0]
+            other_nodes = set().union(*comps[1:])
+            bridge_path = _shortest_bridge_between(main_comp, other_nodes)
+            if not bridge_path:
+                # 剩余孤岛在全库图里也完全不可达，标记为真·全库孤立表
+                unreachable_tables.update(other_nodes)
+                break
+            for node in bridge_path[1:-1]:
+                if node not in selected_set:
+                    selected_set.add(node)
+                    ordered_tables.append(node)
+                    bridge_tables.append(node)
 
-        return join_clauses
+        # ============ 第 2 步：收集集合内所有边，按权重 MST 划分为「主干边」与「备选替换边」 ============
+        active_tables = [t for t in ordered_tables if t not in unreachable_tables]
+        active_set = set(active_tables)
+
+        candidate_edges: List[Dict[str, Any]] = []
+        seen_pairs: Set[Tuple[str, str]] = set()
+        for u in active_tables:
+            for v in sorted(adj.get(u, ())):
+                if v not in active_set:
+                    continue
+                t_pair = (u, v) if u <= v else (v, u)
+                if t_pair in seen_pairs:
+                    continue
+                seen_pairs.add(t_pair)
+                weight = round(float(edge_weights.get(t_pair, 1.0)), 2)
+                cond = edge_conds.get(t_pair, f"{t_pair[0]}.id = {t_pair[1]}.id")
+                matching_rels = [
+                    r for (lt, _, rt, _), r in self._relationships.items()
+                    if (lt, rt) == t_pair
+                ]
+                cnt = max((int(r.get("verified_count", 1)) for r in matching_rels), default=1)
+                sources = sorted({str(r.get("source", "physical_fk")) for r in matching_rels})
+                tag = f"[来源: {'/'.join(sources)} | 验证: {cnt}次 | 权重: {weight}]"
+                candidate_edges.append({
+                    "u": t_pair[0],
+                    "v": t_pair[1],
+                    "weight": weight,
+                    "condition": cond,
+                    "formatted": f"`{t_pair[0]}` JOIN `{t_pair[1]}` ON `{cond}` {tag}",
+                })
+
+        # 按权重从高到低排序，用并查集 (Union-Find) 选出无环最大生成树主干，其余归入备选替换边
+        candidate_edges.sort(key=lambda e: (-e["weight"], e["u"], e["v"]))
+        parent = {t: t for t in active_tables}
+
+        def _find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        backbone_edges: List[str] = []
+        alternative_edges: List[str] = []
+
+        for edge in candidate_edges:
+            ru, rv = _find(edge["u"]), _find(edge["v"])
+            if ru != rv:
+                parent[ru] = rv
+                backbone_edges.append(edge["formatted"])
+            else:
+                alternative_edges.append(edge["formatted"])
+
+        return {
+            "final_tables": ordered_tables,
+            "bridge_tables": bridge_tables,
+            "unreachable_tables": sorted(unreachable_tables),
+            "backbone_edges": backbone_edges,
+            "alternative_edges": alternative_edges,
+        }
+
+    def find_join_bridges(self, target_tables: List[str]) -> List[str]:
+        """兼容接口：返回主干关联边 + 备选关联边列表"""
+        sub = self.resolve_connected_subgraph(target_tables)
+        return sub["backbone_edges"] + sub["alternative_edges"]
+
+    SCHEMA_ERROR_KEYWORDS = (
+        "no such column",
+        "no such table",
+        "does not exist",
+        "undefined column",
+        "unknown column",
+        "invalid column",
+        "binder error",
+        "referenced column",
+    )
+
+    def handle_sql_schema_error(self, error_msg: str) -> bool:
+        """异常驱动缓存击穿自愈：当 SQL 报错提示表或字段不存在时，立即强刷 Redis 缓存并重跑三步对账"""
+        lowered = (error_msg or "").lower()
+        if any(kw in lowered for kw in self.SCHEMA_ERROR_KEYWORDS):
+            agent_logger.warning(
+                f"Detected SQL schema mismatch error ({error_msg[:120]}), forcing Redis cache invalidation & lineage reconciliation"
+            )
+            self.load_schema(force_refresh=True)
+            return True
+        return False
 
     def build_schema_map_prompt(
         self,
         query: str,
         top_k: int = 5,
         token_budget_chars: int = 3200,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
-        schema = self.load_schema()
-        ranked = self.compute_table_rank(query=query)
+        # Agent 调用 inspect_schema_map(query) 工具时，唯一调用的就是这个函数。
+
+        schema = self.load_schema(force_refresh=force_refresh)# 第一阶段：加载表结构并跑三层漏斗建边
+        ranked = self.compute_table_rank(query=query)# 第二阶段：跑 PageRank 选 Top-K 核心表
+        score_map = dict(ranked)
         selected = [t for t, _ in ranked[:top_k]]
-        join_bridges = self.find_join_bridges(selected)
+
+        # 第二阶段：1. 迭代 BFS 补全断桥表 + 2. 带权最大生成树划分「默认主干边」与「备选替换边」
+        subgraph = self.resolve_connected_subgraph(selected)
+        final_tables = subgraph["final_tables"]
+        bridge_set = set(subgraph["bridge_tables"])
+        backbone_edges = subgraph["backbone_edges"]
+        alternative_edges = subgraph["alternative_edges"]
 
         lines = [
             "## 🗺️ 数仓血缘骨架图 (Schema-Map via Two-Phase Table-Rank)",
-            f"针对查询意图「{query or '全库概览'}」，基于第一阶段三层漏斗建图选出的 Top-{len(selected)} 核心表：",
+            f"针对查询意图「{query or '全库概览'}」，选出核心表与自动补全桥表共 {len(final_tables)} 张：",
         ]
-        for rank_idx, (t_name, score) in enumerate(ranked[:top_k], 1):
+        for rank_idx, t_name in enumerate(final_tables, 1):
             meta = schema.get(t_name, {})
+            score = score_map.get(t_name, 0.0)
+            bridge_tag = " [自动补全桥表]" if t_name in bridge_set else ""
             cols = ", ".join(
                 f"{c['name']}({c['type']})" for c in meta.get("columns", [])
             )
             lines.append(
-                f"{rank_idx}. **{t_name}** [TableRank={score:.3f}] — {meta.get('description', '')}\n"
+                f"{rank_idx}. **{t_name}** [TableRank={score:.3f}]{bridge_tag} — {meta.get('description', '')}\n"
                 f"   - 主键: `{meta.get('primary_key', 'id')}` | 字段: {cols}"
             )
 
-        if join_bridges:
-            lines.append("\n### 🔗 最短跨表连接路径（请严格按此路径写 JOIN ON，禁止臆造外键）：")
-            for bridge in join_bridges:
-                lines.append(f"- {bridge}")
+        if backbone_edges:
+            lines.append("\n### 🌲 1. 默认主干连法（无环生成树，已连通上方所有表，常规查询直接选用）：")
+            for edge_str in backbone_edges:
+                lines.append(f"- {edge_str}")
+
+        if alternative_edges:
+            lines.append(
+                "\n### 🔄 2. 备选替换连法（细粒度/复合键替代边 — 需按细粒度关联时用于【替换】上方对应主干，严禁与主干同时堆叠形成三角形环路！）："
+            )
+            for edge_str in alternative_edges:
+                lines.append(f"- {edge_str}")
+
+        if subgraph["unreachable_tables"]:
+            lines.append(
+                f"\n⚠️ 全库孤立表提示：{subgraph['unreachable_tables']} 与其他表无任何外键关联。"
+            )
 
         rendered = "\n".join(lines)[:token_budget_chars]
         return {
-            "ranked_tables": [{"table": t, "score": round(s, 4)} for t, s in ranked[:top_k]],
-            "join_paths": join_bridges,
+            "ranked_tables": [
+                {"table": t, "score": round(score_map.get(t, 0.0), 4), "is_bridge": t in bridge_set}
+                for t in final_tables
+            ],
+            "backbone_edges": backbone_edges,
+            "alternative_edges": alternative_edges,
+            "join_paths": backbone_edges + alternative_edges,
             "persisted_relationships_count": len(self._relationships),
             "schema_map_markdown": rendered,
         }
