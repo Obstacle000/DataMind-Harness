@@ -17,7 +17,7 @@ def assign_skill(skill_name: str, agent_name: str = "main") -> str:
     """将技能分配给指定的 Agent。
 
     Args:
-        skill_name: 技能名称（目录名），例如 "procurement-analysis"
+        skill_name: 技能名称（目录名），例如 "metric-attribution"
         agent_name: 目标Agent名称，"main" 表示主Agent，其他为子Agent名称
 
     Returns:

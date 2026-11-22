@@ -15,7 +15,7 @@ from typing import Any
 
 DEFAULT_USER_ID = "default_user"
 _request_sandbox: ContextVar[Any | None] = ContextVar(
-    "erp_agent_request_sandbox", default=None
+    "datamind_request_sandbox", default=None
 )
 _sandboxes_by_user: dict[str, Any] = {}
 _registry_lock = RLock()
@@ -25,12 +25,8 @@ def set_sandbox(sandbox: Any | None, user_id: str = DEFAULT_USER_ID) -> None:
     """注册或移除某位用户的稳定沙箱 Proxy。"""
     with _registry_lock:
         if sandbox is None:
-            # 如果传入的是 None，表示注销
-            # 之所以需要一个注销,是因为如果用户长时间不操作后台会调用 Docker API 删掉容器
-            # 如果没有注销,前端可以拿到已经删除的容器
             _sandboxes_by_user.pop(user_id, None)
         else:
-            # 传入真实沙箱就登记
             _sandboxes_by_user[user_id] = sandbox
 
 
@@ -58,9 +54,4 @@ def reset_sandbox(token: Token[Any | None]) -> None:
 def has_sandbox(user_id: str | None = None) -> bool:
     """检查当前请求（或指定用户）的沙箱是否可用。"""
     sandbox = get_sandbox(user_id)
-    if sandbox is None:
-        return False
-    try:
-        return bool(sandbox.ping())
-    except Exception:
-        return False
+    return sandbox is not None

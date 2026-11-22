@@ -1,6 +1,6 @@
 """
-FastAPI 应用入口
-CORS 全开、路由注册、startup/shutdown 事件
+DataMind-Harness FastAPI 应用入口
+CORS 配置、路由注册、沙箱预热池维护与生命周期管理
 """
 import sys
 import os
@@ -8,7 +8,6 @@ import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager, suppress
 
-# 确保项目根目录在 path 中
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from fastapi import FastAPI
@@ -24,23 +23,15 @@ from ..agent.config import SANDBOX_MAINTENANCE_INTERVAL_SECONDS
 
 
 async def _sandbox_maintenance(stop_event: asyncio.Event) -> None:
-    """后台补齐预热池、回收空闲容器。
-
-    主请求中的 SandboxHealthMiddleware 才负责“重建 + Proxy 热替换 + 文件回填”；此处
-    绝不直接调用 ``health_check_all``，否则 Agent 仍会持有旧后端引用。
-    """
-    # SandboxHealthMiddleware该中间件每一次请求前都会检查容器并重建
+    """后台补齐预热池、回收空闲容器。"""
     while not stop_event.is_set():
         try:
-            # 1. 回收超时不用的沙箱
             await asyncio.to_thread(sandbox_manager.cleanup_idle_sandboxes)
-            # 2. 只要池子没满，定期自动补齐预热池！
             await asyncio.to_thread(sandbox_manager.ensure_warm_pool)
         except Exception as exc:
             web_logger.warning(f"Sandbox maintenance iteration failed: {exc}")
 
         try:
-            # 每隔一段时间（如 60 秒）自动跑一轮
             await asyncio.wait_for(
                 stop_event.wait(), timeout=SANDBOX_MAINTENANCE_INTERVAL_SECONDS
             )
@@ -51,39 +42,34 @@ async def _sandbox_maintenance(stop_event: asyncio.Event) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    web_logger.info("Starting ERP Agent Web Server...")
+    web_logger.info("Starting DataMind-Harness Web Server...")
     stop_event = asyncio.Event()
     maintenance_task = None
     try:
-        # 1. 服务启动的第 0 秒，立刻调用 ensure_warm_pool 灌满预热池！
-        # 预热失败不阻止 Web 服务启动；首个请求仍会按需创建并回退到 LocalShell。
         await asyncio.to_thread(sandbox_manager.ensure_warm_pool)
-        # # 2. 启动上面的常驻后台线程持续巡检
         maintenance_task = asyncio.create_task(
             _sandbox_maintenance(stop_event), name="sandbox-maintenance"
         )
         yield
     finally:
-        web_logger.info("Shutting down ERP Agent Web Server...")
+        web_logger.info("Shutting down DataMind-Harness Web Server...")
         stop_event.set()
         if maintenance_task is not None:
             maintenance_task.cancel()
             with suppress(asyncio.CancelledError):
                 await maintenance_task
-        # 不销毁已认领容器：Manager 会把 user → container 映射持久化，重启后可恢复。
         await close_mongo_client()
         from ..agent.observability import shutdown
         await shutdown()
 
 
 app = FastAPI(
-    title="DeepAgent 智能采购助手",
-    description="基于 Harness Engineering 架构的摩托车零部件采购智能助手 API",
+    title="DataMind-Harness 智能 BI 与数据科学 Agent",
+    description="基于 Harness Engineering 控制流治理架构的自愈型智能 BI、NL2SQL 与生成式可视化 API",
     version="1.0.0",
     lifespan=lifespan,
 )
 
-# CORS 全开（开发环境）
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -92,18 +78,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 注册路由
 app.include_router(chat_router)
 app.include_router(history_router)
 
-# 文件下载目录（图表等生成文件）
 DOWNLOAD_DIR = Path(__file__).resolve().parent.parent / "download"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 
 @app.get("/api/download/{filename}")
 async def download_file(filename: str):
-    """提供生成文件（图表PNG等）的HTTP下载"""
+    """提供沙箱生成文件（图表、导出数据、分析报告）的 HTTP 下载"""
     file_path = DOWNLOAD_DIR / filename
     if not file_path.exists() or not file_path.is_file():
         from fastapi import HTTPException
@@ -117,7 +101,7 @@ async def download_file(filename: str):
 
 @app.get("/")
 async def root():
-    return {"message": "DeepAgent 智能采购助手 API", "version": "1.0.0"}
+    return {"message": "DataMind-Harness 智能 BI 与数据科学 Agent API", "version": "1.0.0"}
 
 
 @app.get("/health")

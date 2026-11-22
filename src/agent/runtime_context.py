@@ -10,10 +10,10 @@ from typing import Any
 
 
 _current_user_id: ContextVar[str] = ContextVar(
-    "erp_agent_current_user_id", default="default_user"
+    "datamind_current_user_id", default="default_user"
 )
 _current_store: ContextVar[Any | None] = ContextVar(
-    "erp_agent_current_store", default=None
+    "datamind_current_store", default=None
 )
 
 

@@ -225,7 +225,7 @@ class SandboxManager:
     def _create_warm_container(self) -> SandboxEntry:
         """创建一个预热容器"""
         # 生成唯一容器名
-        name = f"erp-sandbox-warm-{uuid.uuid4().hex[:12]}"
+        name = f"datamind-sandbox-warm-{uuid.uuid4().hex[:12]}"
 
         # python:3.11-slim 已带 Python；图表和 Skill 依赖按需安装到
         # /workspace/python-packages，预热阶段不做耗时网络安装。
@@ -331,7 +331,7 @@ class SandboxManager:
                 return current.sandbox
 
         safe_user_id = "".join(c if c.isalnum() else "_" for c in user_id)
-        name = f"erp-sandbox-{safe_user_id}-{uuid.uuid4().hex[:12]}"
+        name = f"datamind-sandbox-{safe_user_id}-{uuid.uuid4().hex[:12]}"
 
         config = SandboxConfig(name=name, runtimes=[])
         sandbox = create_secure_sandbox(config)
@@ -380,7 +380,7 @@ class SandboxManager:
             from pymongo import MongoClient
             import os
             mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
-            db_name = os.getenv("MONGODB_DB_NAME", "erp_agent")
+            db_name = os.getenv("MONGODB_DB_NAME", "datamind_harness")
 
             client = MongoClient(mongo_uri, serverSelectionTimeoutMS=3000)
             db = client[db_name]
@@ -403,7 +403,7 @@ class SandboxManager:
             import os
             import docker
             mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
-            db_name = os.getenv("MONGODB_DB_NAME", "erp_agent")
+            db_name = os.getenv("MONGODB_DB_NAME", "datamind_harness")
 
             client = MongoClient(mongo_uri, serverSelectionTimeoutMS=3000)
             db = client[db_name]
@@ -465,7 +465,7 @@ class SandboxManager:
             from pymongo import MongoClient
             import os
             mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
-            db_name = os.getenv("MONGODB_DB_NAME", "erp_agent")
+            db_name = os.getenv("MONGODB_DB_NAME", "datamind_harness")
 
             client = MongoClient(mongo_uri, serverSelectionTimeoutMS=3000)
             db = client[db_name]

@@ -35,7 +35,7 @@ class SandboxConfig:
 
     # --- 基础 ---
     image: str = SANDBOX_IMAGE
-    name: str = "erp-sandbox"
+    name: str = "datamind-sandbox"
     work_dir: str = SANDBOX_WORK_DIR
 
     # --- 安全防护 ---
@@ -351,7 +351,7 @@ def create_and_setup_sandbox(
 
     # 生成用户隔离的容器名
     safe_user_id = "".join(c if c.isalnum() else "_" for c in user_id)
-    container_name = f"erp-sandbox-{safe_user_id}"
+    container_name = f"datamind-sandbox-{safe_user_id}"
 
     config = SandboxConfig(
         name=container_name,

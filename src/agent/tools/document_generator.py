@@ -8,10 +8,10 @@
 - 沙箱不可用时回退到本地生成
 
 使用场景：
-- 采购分析报告 → Markdown
-- 供应商对比表 → CSV / HTML Table
-- 数据导出 → JSON
-- 会议纪要 → Markdown / HTML
+- 经营指标归因分析报告 → Markdown
+- 多维度交叉对比表 → CSV / HTML Table
+- 数据集导出 → JSON
+- 商业洞察周报 → Markdown / HTML
 """
 import os
 import json

@@ -78,7 +78,7 @@ def _upload_project_to_sandbox(sandbox) -> bool:
 
         # 仅使用 BaseSandbox 的公开协议上传；这样 SandboxBackendProxy 热替换
         # 底层容器后，项目上传仍能工作，且不会依赖 Docker 私有 _container。
-        archive_path = "/tmp/erp-agent-project.tar.gz"
+        archive_path = "/tmp/datamind-project.tar.gz"
         responses = sandbox.upload_files([(archive_path, data)])
         errors = [getattr(item, "error", None) for item in responses]
         if not responses or any(errors):
@@ -149,13 +149,13 @@ def _load_skills_prompt(skills_dir: Path) -> str:
 
 async def precompute_agent_context(
     user_id: str = "default_user",
-    username: str = "用户",
+    username: str = "数据分析师",
     store=None,
-) -> ProcurementContext:
+) -> DataMindContext:
     """
     预计算 Agent 上下文
 
-    从 Store 加载用户历史偏好与 WARM 层记忆摘要，构造完整的 ProcurementContext。
+    从 Store 加载用户历史偏好与 WARM 层记忆摘要，构造完整的 DataMindContext。
     如果 Store 不可用则使用默认值。
     """
     preferences = {}
@@ -183,7 +183,7 @@ async def precompute_agent_context(
         except Exception as e:
             agent_logger.warning(f"Failed to build warm memory: {e}")
 
-    return ProcurementContext(
+    return DataMindContext(
         user_id=user_id,
         username=username,
         preferences=preferences,
@@ -192,7 +192,7 @@ async def precompute_agent_context(
 
 
 def create_main_agent(
-    user_context: Optional[ProcurementContext] = None,
+    user_context: Optional[DataMindContext] = None,
     checkpointer=None,
     store=None,
 ):
@@ -202,9 +202,9 @@ def create_main_agent(
     组装顺序（严格遵循文档）：
     1. LLM（DeepSeek）
     2. CompositeBackend 三层路由（default=sandbox, /memories/=Store, /persisted-skills/=Store）
-    3. 工具加载（MCP + chart + web_search + hitl）
-    4. 子Agent配置（YAML声明式）
-    5. 中间件栈（7自定义 + 框架内置）
+    3. 工具加载（DataMind 数仓/OLAP/ECharts + MCP + chart + web_search + hitl）
+    4. 子Agent配置（YAML声明式：schema-engineer / python-scientist / report-narrator）
+    5. 中间件栈（自定义 + 框架内置）
     6. 创建 Agent
 
     Args:
@@ -216,7 +216,7 @@ def create_main_agent(
         CompiledStateGraph - 可执行的 Agent 图
     """
     if user_context is None:
-        user_context = ProcurementContext()
+        user_context = DataMindContext()
 
     agent_logger.info(f"Creating main agent for user: {user_context.user_id}")
 

@@ -63,7 +63,7 @@ def web_fetch(url: str, max_chars: int = 8000) -> str:
             url,
             follow_redirects=True,
             timeout=20,
-            headers={"User-Agent": "ERP-Agent/1.0 (Skill Downloader)"},
+            headers={"User-Agent": "DataMind-Harness/1.0 (Skill Downloader)"},
         )
 
         if response.status_code != 200:
@@ -413,7 +413,7 @@ def install_skill(url: str, skill_name: str = "") -> str:
             url,
             follow_redirects=True,  # 自动跟随重定向
             timeout=30,              # 30秒超时
-            headers={"User-Agent": "ERP-Agent/1.0 (Skill Installer)"},  # 设置 User-Agent
+            headers={"User-Agent": "DataMind-Harness/1.0 (Skill Installer)"},  # 设置 User-Agent
         )
         # 检查 HTTP 响应状态码
         if response.status_code != 200:

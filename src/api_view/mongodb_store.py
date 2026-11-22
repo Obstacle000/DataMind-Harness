@@ -80,7 +80,7 @@ class MongoDBStore(BaseStore):
     def __init__(
         self,
         uri: str = "mongodb://localhost:27017",
-        db_name: str = "erp_agent",
+        db_name: str = "datamind_harness",
         collection_name: str = "langgraph_store",
     ):
         super().__init__()

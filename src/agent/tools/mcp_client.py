@@ -1,11 +1,11 @@
 """
 MCP 工具加载模块
-使用 langchain-mcp-adapters 连接 MCP Server（SSE模式），获取所有 ERP 工具
+使用 langchain-mcp-adapters 连接 DataMind MCP Server（SSE模式），获取所有外部数据源工具
 
 生产级实现：
 - 连接重试（指数退避）
 - 连接健康检查
-- 优雅降级（MCP不可用时返回空工具列表，Agent仍可对话）
+- 优雅降级（MCP不可用时返回空工具列表，Agent仍可使用内置数仓与OLAP工具）
 """
 import asyncio
 import time
@@ -52,7 +52,7 @@ async def load_mcp_tools(force_refresh: bool = False) -> List[BaseTool]:
         try:
             client = MultiServerMCPClient(
                 {
-                    "erp": {
+                    "datamind": {
                         "url": MCP_SSE_URL,
                         "transport": "sse",
                     }
@@ -84,7 +84,7 @@ async def load_mcp_tools(force_refresh: bool = False) -> List[BaseTool]:
 
     mcp_logger.error(
         f"All {MAX_RETRIES} MCP connection attempts failed. Last error: {last_error}. "
-        f"Agent will operate without ERP tools."
+        f"Agent will operate with built-in PostgreSQL / DuckDB OLAP tools."
     )
     return []
 

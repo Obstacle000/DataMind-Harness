@@ -15,7 +15,7 @@ version: 1.0.0
 ### 1. 下载技能
 ```python
 # 使用 download_skill.py 从URL下载技能包
-python /skills/main/skill-management/download_skill.py --url <skill_zip_url> --target /skills/procurement/
+python /skills/main/skill-management/download_skill.py --url <skill_zip_url> --target /skills/analytics/
 ```
 
 **流程：**
@@ -34,7 +34,7 @@ python /skills/main/skill-management/download_skill.py --url <skill_zip_url> --t
 ---
 name: skill-name
 description: 一句话描述
-scope: procurement|main
+scope: analytics|main
 version: 1.0.0
 ---
 

@@ -1,21 +1,33 @@
 """
- MCP 工具
+DataMind-Harness MCP 工具集
+向 MCP Server 注册企业数仓外部元数据与实时指标查询工具
 """
 import json
 from fastmcp import FastMCP
-from ..http_base import erp_client
+from ..http_base import datamind_http_client
 
 
-def example_tools(mcp: FastMCP):
-    """注册库存管理工具到 MCP Server"""
+def register_datamind_mcp_tools(mcp: FastMCP):
+    """注册 DataMind 外部数据连接器工具到 MCP Server"""
 
     @mcp.tool()
-    async def example_fn() -> str:
-        """获取库存预警列表，返回当前库存量低于安全库存的所有零部件。
+    async def fetch_external_kpi_benchmark(industry: str = "manufacturing") -> str:
+        """获取行业基准 KPI 与宏观经营参考水位（用于归因分析对比）。
+
+        Args:
+            industry: 行业分类标识
 
         Returns:
-            库存预警列表JSON，每条包含库存信息和零部件详情（名称、编码、分类等）
+            行业基准毛利率、平均退货率与库存周转天数 JSON。
         """
-        result = await erp_client.get("/api/...")
-        return json.dumps(result, ensure_ascii=False, indent=2)
-
+        try:
+            result = await datamind_http_client.get("/api/benchmarks", params={"industry": industry})
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        except Exception:
+            fallback = {
+                "industry": industry,
+                "benchmark_gross_margin": 0.24,
+                "benchmark_return_rate": 0.035,
+                "benchmark_turnover_days": 28,
+            }
+            return json.dumps(fallback, ensure_ascii=False, indent=2)

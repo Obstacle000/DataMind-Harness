@@ -1,7 +1,7 @@
 """
 Docker 沙箱后端
 继承 deepagents BaseSandbox，通过 Docker SDK 在隔离容器中执行命令和操作文件。
-容器名: erp-sandbox（由 SandboxManager 管理）.
+容器名: datamind-sandbox（由 SandboxManager 管理）.
 """
 import docker
 import base64
@@ -29,13 +29,13 @@ class CustomOpenSandbox(BaseSandbox):
     自动委托给 execute()（即 docker exec）。
 
     使用方式：
-        backend = DockerSandboxBackend(container_name="erp-sandbox")
+        backend = CustomOpenSandbox(container_name="datamind-sandbox")
         result = backend.execute("python -c 'print(1+1)'")
     """
     # 每一个真实在跑的 Docker 容器，都对应一个 CustomOpenSandbox 实例；
     def __init__(
         self,
-        container_name: str = "erp-sandbox",
+        container_name: str = "datamind-sandbox",
         work_dir: str = SANDBOX_WORK_DIR,
         timeout: int = DEFAULT_EXECUTE_TIMEOUT,
     ):

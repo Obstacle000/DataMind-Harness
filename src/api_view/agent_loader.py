@@ -9,7 +9,7 @@ from typing import Any, Optional
 from datetime import datetime
 
 from ..agent.log_utils import web_logger
-from ..agent.schema import ProcurementContext
+from ..agent.schema import DataMindContext
 from .web_config import get_db
 
 
@@ -178,7 +178,7 @@ class AgentLoader:
         """在线程池中构建 Agent；其中包含 Docker/Mongo 同步 I/O。"""
         from ..agent.main_agent import create_main_agent
 
-        context = ProcurementContext(user_id=user_id, username=username)
+        context = DataMindContext(user_id=user_id, username=username)
         return create_main_agent(
             user_context=context,
             checkpointer=self._checkpointer,

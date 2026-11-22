@@ -3,7 +3,7 @@
 从沙箱容器中下载文件到宿主机 src/download/ 目录，供用户通过 HTTP 访问。
 
 工作原理：
-1. 通过 Docker SDK 连接到 erp-sandbox 容器
+1. 通过 Docker SDK 连接到 datamind-sandbox 容器
 2. 使用 base64 编码读取容器内文件（避免二进制传输问题）
 3. 解码并写入宿主机 download 目录
 4. 返回 HTTP 下载链接
@@ -30,16 +30,16 @@ def _get_docker_container():
         import docker
         client = docker.from_env()
         # 尝试连接默认沙箱容器
-        for name in ["erp-sandbox", "erp-sandbox-default_user"]:
+        for name in ["datamind-sandbox", "datamind-sandbox-default_user"]:
             try:
                 container = client.containers.get(name)
                 if container.status == "running":
                     return container, client
             except Exception:
                 continue
-        # 尝试查找任何 erp-sandbox- 开头的容器
+        # 尝试查找任何 datamind-sandbox- 开头的容器
         for container in client.containers.list():
-            if container.name.startswith("erp-sandbox-") and container.status == "running":
+            if container.name.startswith("datamind-sandbox-") and container.status == "running":
                 return container, client
         return None, None
     except Exception as e:

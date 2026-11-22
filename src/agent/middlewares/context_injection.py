@@ -1,6 +1,6 @@
 """
 中间件 2: 用户上下文注入（工厂模式，请求级隔离）
-将 ProcurementContext 注入到 agent state 的 configurable 中。
+将 DataMindContext 注入到 agent state 的 configurable 中。
 
 设计要点：
 - 使用 dict 按 thread_id 存储用户上下文，避免全局单例串扰
@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 
 from langchain.agents.middleware import AgentMiddleware, Runtime
 from ..log_utils import middleware_logger
-from ..schema import ProcurementContext
+from ..schema import DataMindContext
 
 
 class ContextInjectionMiddleware(AgentMiddleware):
@@ -25,18 +25,15 @@ class ContextInjectionMiddleware(AgentMiddleware):
     - 支持动态偏好更新（从 store 加载最新偏好）
 
     隔离机制：
-    - _context_store: Dict[thread_id, ProcurementContext]
+    - _context_store: Dict[thread_id, DataMindContext]
     - 每个会话线程拥有独立的上下文副本
     - 线程安全：使用 threading.Lock 保护并发读写
     """
-    # 正常的话user_context应该来自前端传userid和username然后在agent_loader里的_build_agent_for_user构建
-    # 否则就是默认的初始化
-    # 没有注册接口前端会发一个测试数据,userid是固定的
-    def __init__(self, user_context: ProcurementContext | None = None):
+    def __init__(self, user_context: DataMindContext | None = None):
         # 默认上下文（仅作为 fallback）
-        self._default_context = user_context or ProcurementContext()
-        # 请求级隔离存储：thread_id → ProcurementContext
-        self._context_store: Dict[str, ProcurementContext] = {}
+        self._default_context = user_context or DataMindContext()
+        # 请求级隔离存储：thread_id → DataMindContext
+        self._context_store: Dict[str, DataMindContext] = {}
         self._lock = threading.Lock()
         self.tools = []
 
@@ -72,7 +69,7 @@ class ContextInjectionMiddleware(AgentMiddleware):
 
     def update_context(
         self,
-        user_context: ProcurementContext,
+        user_context: DataMindContext,
         thread_id: str = "",
     ):
         """
@@ -91,7 +88,7 @@ class ContextInjectionMiddleware(AgentMiddleware):
             else:
                 self._default_context = user_context
 
-    def get_current_context(self, thread_id: str = "") -> ProcurementContext:
+    def get_current_context(self, thread_id: str = "") -> DataMindContext:
         """获取当前上下文"""
         return self._get_context(thread_id)
 
@@ -104,7 +101,7 @@ class ContextInjectionMiddleware(AgentMiddleware):
     # 内部方法
     # ============================================================
 
-    def _get_context(self, thread_id: str) -> ProcurementContext:
+    def _get_context(self, thread_id: str) -> DataMindContext:
         """获取指定线程的上下文（线程安全）"""
         with self._lock:
             # 下面永远是none,因为update_context没人调用
@@ -130,7 +127,7 @@ class ContextInjectionMiddleware(AgentMiddleware):
 # ============================================================
 
 def create_context_middleware(
-    user_context: ProcurementContext | None = None,
+    user_context: DataMindContext | None = None,
 ) -> ContextInjectionMiddleware:
     """
     工厂函数：创建用户上下文注入中间件

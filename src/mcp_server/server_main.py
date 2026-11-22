@@ -1,31 +1,23 @@
 """
-MCP Server 入口
-FastMCP 实例创建，注册所有 tools，SSE 传输协议
+DataMind-Harness MCP Server 入口
+FastMCP 实例创建，注册外部数据连接器 tools，SSE 传输协议
 """
 import sys
 import os
 
-# 确保项目根目录在 path 中
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from fastmcp import FastMCP
 from src.mcp_server.server_config import MCP_HOST, MCP_PORT
-from src.mcp_server.tools.suppliers_tools import register_supplier_tools
-from src.mcp_server.tools.parts_tools import register_parts_tools
-from src.mcp_server.tools.order_tools import register_order_tools
-from src.mcp_server.tools.example_tools import register_inventory_tools
+from src.mcp_server.tools.example_tools import register_datamind_mcp_tools
 
-# 创建 MCP Server 实例
 mcp = FastMCP(
-    name="ERP-MCP",
-    instructions="示例。",
+    name="DataMind-MCP",
+    instructions="DataMind-Harness 外部数据网关与行业基准指标 MCP 服务。",
 )
 
-# 注册所有工具
-example_tools(mcp)
-
-
+register_datamind_mcp_tools(mcp)
 
 if __name__ == "__main__":
-    print(f"🚀 Starting MCP Server on {MCP_HOST}:{MCP_PORT} (SSE transport)")
+    print(f"🚀 Starting DataMind-MCP Server on {MCP_HOST}:{MCP_PORT} (SSE transport)")
     mcp.run(transport="sse", host=MCP_HOST, port=MCP_PORT)

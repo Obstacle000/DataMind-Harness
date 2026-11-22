@@ -55,10 +55,10 @@ _SUPPLIER_TOOLS = ("supplier_query", "supplier_get", "supplier_page")
 
 # 任务类型关键词（与 harness_config.yaml 的 task_types 保持一致）
 TASK_TYPE_KEYWORDS = {
-    "analysis": ("分析", "对比", "统计", "趋势", "报表", "图表", "报告", "评估"),
-    "order": ("下单", "采购", "订单", "新增", "修改", "审批", "创建"),
-    "inventory": ("库存", "入库", "出库", "盘点", "预警"),
-    "supplier": ("供应商", "供货", "信用"),
+    "sql_extraction": ("查询", "取数", "SQL", "表结构", "血缘", "明细", "汇总", "排名", "销售额", "订单"),
+    "statistical_analysis": ("分析", "对比", "统计", "趋势", "归因", "为什么", "暴跌", "下滑", "预测", "净利率", "毛利", "退货率"),
+    "visualization": ("图表", "可视化", "画图", "折线图", "柱状图", "雷达图", "瀑布图", "饼图", "看板", "ECharts"),
+    "data_writeback": ("写回", "标记", "更新状态", "暂停", "冻结", "导出", "审批", "修改"),
 }
 
 

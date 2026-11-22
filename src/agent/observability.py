@@ -9,7 +9,7 @@ import threading
 import time
 from contextvars import ContextVar
 from langchain_core.callbacks import BaseCallbackHandler
-_current = ContextVar('erp_trace', default=None)
+_current = ContextVar('datamind_trace', default=None)
 _client = None
 _client_lock = threading.Lock()
 # 1. 外部调用chat接口,会调用stream_chat_response的修饰器@traced_stream
@@ -49,25 +49,28 @@ _client_lock = threading.Lock()
 #   └─ request.first_token [ 650ms ]
 def client():
     global _client
-    if os.getenv('ERP_LANGFUSE_ENABLED', 'false').lower() != 'true': return None
-    if not all(os.getenv(k) for k in ('LANGFUSE_SECRET_KEY', 'LANGFUSE_PUBLIC_KEY', 'LANGFUSE_BASE_URL', 'ERP_TRACE_HASH_KEY')): return None
+    enabled = os.getenv('DATAMIND_LANGFUSE_ENABLED', os.getenv('ERP_LANGFUSE_ENABLED', 'false'))
+    if enabled.lower() != 'true': return None
+    hash_key = os.getenv('DATAMIND_TRACE_HASH_KEY', os.getenv('ERP_TRACE_HASH_KEY'))
+    if not all(os.getenv(k) for k in ('LANGFUSE_SECRET_KEY', 'LANGFUSE_PUBLIC_KEY', 'LANGFUSE_BASE_URL')) or not hash_key: return None
     with _client_lock:
         if _client is None:
             try:
                 from langfuse import Langfuse
-                if os.getenv('ERP_LANGFUSE_DIRECT','false').lower()=='true':
+                if os.getenv('DATAMIND_LANGFUSE_DIRECT', os.getenv('ERP_LANGFUSE_DIRECT','false')).lower()=='true':
                     from urllib.parse import urlparse
                     host=urlparse(os.environ['LANGFUSE_BASE_URL']).hostname
                     if host: os.environ['NO_PROXY']=','.join(filter(None,[os.getenv('NO_PROXY',''),host]))
                 _client = Langfuse(timeout=10, flush_at=20, flush_interval=5,
-                    environment=os.getenv('ERP_TRACE_ENVIRONMENT','development'),
-                    release=os.getenv('ERP_TRACE_RELEASE','unversioned'))
+                    environment=os.getenv('DATAMIND_TRACE_ENVIRONMENT', os.getenv('ERP_TRACE_ENVIRONMENT','development')),
+                    release=os.getenv('DATAMIND_TRACE_RELEASE', os.getenv('ERP_TRACE_RELEASE','unversioned')))
             except Exception: return None
     return _client
 
 
 def pseudonym(value):
-    return hmac.new(os.environ['ERP_TRACE_HASH_KEY'].encode(), str(value).encode(), hashlib.sha256).hexdigest()[:32]
+    key = os.getenv('DATAMIND_TRACE_HASH_KEY', os.getenv('ERP_TRACE_HASH_KEY', 'datamind-default-key'))
+    return hmac.new(key.encode(), str(value).encode(), hashlib.sha256).hexdigest()[:32]
 
 # 链路追踪器 - 底层接入的是大模型领域最主流的开源 APM 平台：Langfuse(开源版langsmith)。
 # 用户发起对话请求 (chat.py)
@@ -102,7 +105,7 @@ class Trace:
                 with propagate_attributes(**identity):
                     # 创建整条追踪链的总入口
                     # 后续所有的 model.call、skills.read 都是挂在它底下的子树枝。
-                    self.root = self.client.start_observation(name='erp.request', as_type='span')
+                    self.root = self.client.start_observation(name='datamind.request', as_type='span')
                 # 合规安全声明
                 self.root.update(metadata={**identity,'resume': bool(resume), 'content_policy': 'metadata_only'})
             except Exception: self.root = None
@@ -234,7 +237,11 @@ class MetadataCallback(BaseCallbackHandler):
     def on_tool_start(self, serialized, input_str, *, run_id, parent_run_id=None, **kw):
         # Names are code-owned in this project; no arbitrary plugin names exported.
         name=(serialized or {}).get('name','')
-        allowed={'task','read_memory','remember','list_skills','read_skill','read_skill_resource','request_order_info'}
+        allowed={
+            'task','read_memory','remember','list_skills','read_skill','read_skill_resource','request_order_info',
+            'inspect_schema_map','execute_readonly_sql','query_duckdb_olap','generate_echarts_schema',
+            'submit_heavy_analytics_job','execute_writeback_sql','export_sensitive_data',
+        }
         if name not in allowed and not (name.startswith(('part_','supplier_','inventory_','order_')) and name.replace('_','').isascii() and name.replace('_','').isalnum()): name='other'
         self.begin(run_id,parent_run_id,'tool.'+name)
     def on_tool_end(self, output, *, run_id, **kw):
