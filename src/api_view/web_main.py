@@ -19,6 +19,7 @@ from .api.history import router as history_router
 from .web_config import close_mongo_client
 from ..agent.log_utils import web_logger
 from ..agent.backends.sandbox_manager import sandbox_manager
+from ..agent.clients.schema_map import schema_map_engine
 from ..agent.config import SANDBOX_MAINTENANCE_INTERVAL_SECONDS
 
 
@@ -46,6 +47,17 @@ async def lifespan(app: FastAPI):
     stop_event = asyncio.Event()
     maintenance_task = None
     try:
+        # 离线第一阶段预热：服务启动时在后台线程完成 Schema 元数据加载与三层漏斗血缘建图，
+        # 预热完成后线上请求直接命中 MD5 指纹 0ms 短路，避免首个用户请求冷启动卡顿
+        try:
+            schema = await asyncio.to_thread(schema_map_engine.load_schema)
+            web_logger.info(
+                f"Schema-Map Phase 1 warmed up: {len(schema)} tables, "
+                f"{len(schema_map_engine._relationships)} lineage relationships."
+            )
+        except Exception as exc:
+            web_logger.warning(f"Schema-Map startup warmup skipped due to error: {exc}")
+
         await asyncio.to_thread(sandbox_manager.ensure_warm_pool)
         maintenance_task = asyncio.create_task(
             _sandbox_maintenance(stop_event), name="sandbox-maintenance"

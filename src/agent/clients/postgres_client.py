@@ -183,30 +183,67 @@ class PostgresClient:
         try:
             schema_map: Dict[str, Dict[str, Any]] = {}
             with conn.cursor() as cur:
-                # 1. 查询所有 public 下的表和字段
+                # 1. 查询所有 public 下的表、字段、数据类型以及底层真实表注释/列注释
                 cur.execute(
                     """
-                    SELECT table_name, column_name, data_type
-                    FROM information_schema.columns
-                    WHERE table_schema = 'public'
-                    ORDER BY table_name, ordinal_position
+                    SELECT
+                        c.table_name,
+                        c.column_name,
+                        c.data_type,
+                        COALESCE(pgd.description, '') AS column_comment,
+                        COALESCE(obj_description(pgc.oid, 'pg_class'), '') AS table_comment
+                    FROM information_schema.columns AS c
+                    LEFT JOIN pg_catalog.pg_class AS pgc
+                      ON pgc.relname = c.table_name
+                    LEFT JOIN pg_catalog.pg_namespace AS pgn
+                      ON pgn.oid = pgc.relnamespace AND pgn.nspname = c.table_schema
+                    LEFT JOIN pg_catalog.pg_description AS pgd
+                      ON pgd.objoid = pgc.oid AND pgd.objsubid = c.ordinal_position
+                    WHERE c.table_schema = 'public'
+                    ORDER BY c.table_name, c.ordinal_position
                     """
                 )
-                for table_name, col_name, data_type in cur.fetchall():
+                for table_name, col_name, data_type, col_comment, table_comment in cur.fetchall():
                     t_entry = schema_map.setdefault(
                         table_name,
                         {
-                            "description": f"业务表 {table_name}",
-                            "primary_key": "id",
+                            "description": table_comment or f"业务表 {table_name}",
+                            "primary_key": "",
                             "columns": [],
                             "foreign_keys": [],
                         },
                     )
+                    if table_comment and t_entry["description"] == f"业务表 {table_name}":
+                        t_entry["description"] = table_comment
                     t_entry["columns"].append(
-                        {"name": col_name, "type": str(data_type).upper(), "comment": ""}
+                        {"name": col_name, "type": str(data_type).upper(), "comment": col_comment or ""}
                     )
 
-                # 2. 查询外键关系 (Foreign Keys)
+                # 2. 从底层 information_schema 查询真实主键 (PRIMARY KEY)
+                cur.execute(
+                    """
+                    SELECT
+                        tc.table_name,
+                        kcu.column_name
+                    FROM information_schema.table_constraints AS tc
+                    JOIN information_schema.key_column_usage AS kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                      AND tc.table_schema = kcu.table_schema
+                    WHERE tc.constraint_type = 'PRIMARY KEY'
+                      AND tc.table_schema = 'public'
+                    ORDER BY tc.table_name, kcu.ordinal_position
+                    """
+                )
+                for t_name, pk_col in cur.fetchall():
+                    if t_name in schema_map and not schema_map[t_name]["primary_key"]:
+                        schema_map[t_name]["primary_key"] = pk_col
+
+                # 若某张无约束野表未声明 PRIMARY KEY，用其第一列兜底（绝不塞假冒的 "id"）
+                for t_name, t_entry in schema_map.items():
+                    if not t_entry["primary_key"] and t_entry["columns"]:
+                        t_entry["primary_key"] = t_entry["columns"][0]["name"]
+
+                # 3. 查询外键关系 (Foreign Keys)
                 cur.execute(
                     """
                     SELECT

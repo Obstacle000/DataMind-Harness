@@ -2,6 +2,7 @@
 Schema-Map 数仓血缘图谱与 Table-Rank 引擎
 
 ================================================================================
+# build_schema_map_prompt-{load_schema()->_build_adjacency()->compute_table_rank()->resolve_connected_subgraph}
 调用 build_schema_map_prompt(query)
   │
   ├─► 第 1 步：拿表结构 (self._schema)
@@ -74,7 +75,6 @@ import yaml
 
 from .postgres_client import postgres_client
 from .redis_client import redis_client
-from .duckdb_client import duckdb_client
 from ..log_utils import agent_logger
 
 LINEAGE_YAML_PATH = Path(__file__).parent / "schema_lineage.yaml"
@@ -231,17 +231,19 @@ class SchemaMapEngine:
 
     def _prune_stale_relationships(self) -> int:
         """对账第 1 步：剪枝死边（剔除最新表结构中已被删除/改名的表、列或已移除的物理外键）"""
+        # 拿到最新列
         live_table_cols: Dict[str, Set[str]] = {
             t_name: {c["name"] for c in meta.get("columns", [])}
             for t_name, meta in self._schema.items()
         }
+        # 拿到最新物理外键
         live_physical_fks: Set[Tuple[str, str, str, str]] = set()
         for t_name, meta in self._schema.items():
             for fk in meta.get("foreign_keys", []):
                 live_physical_fks.add(
                     self._canonical_4tuple(t_name, fk["column"], fk["ref_table"], fk["ref_column"])
                 )
-
+        # 原本是物理外键,现在不是了的键
         stale_keys: List[Tuple[str, str, str, str]] = []
         for key, rel in self._relationships.items():
             lt, lc, rt, rc = key
@@ -267,6 +269,8 @@ class SchemaMapEngine:
     def _run_phase1_discovery_funnel(self, force_reconcile: bool = False) -> None:
         """执行第一阶段三层探边漏斗 + 表结构变更三步对账（剪枝死边 -> 同步外键 -> 增量探新 -> 覆写 YAML）"""
         if not self._schema:
+            # 这个函数是大模型调用工具的时候执行的,直接报错会导致崩溃,所以返回空
+            # 让大模型以为没查到
             return
 
         current_hash = self._compute_schema_hash(self._schema)
@@ -276,7 +280,7 @@ class SchemaMapEngine:
             and self._relationships
         ):
             return  # 表结构 MD5 指纹未变，0 毫秒直接放行！
-
+        # 指纹变了,意味着表结构发生了变化,只有_schema是最新的
         self._bootstrapped_schema_hash = current_hash
 
         raw_data: Dict[str, Any] = {}
@@ -285,7 +289,7 @@ class SchemaMapEngine:
                 raw_data = yaml.safe_load(self.lineage_path.read_text(encoding="utf-8")) or {}
             except Exception as exc:
                 agent_logger.warning(f"Failed to read {self.lineage_path}: {exc}")
-
+        # 记录内存里的关系表 self._relationships 有没有发生过任何变化，从而决定最后要不要重新写一次 schema_lineage.yaml 磁盘文件。
         dirty = False
 
         # 0. 首次从 schema_lineage.yaml 加载持久化关系（同时自动对文件做四元组去重）
@@ -304,8 +308,10 @@ class SchemaMapEngine:
                     continue
                 key = self._canonical_4tuple(lt, lc, rt, rc)
                 if key in seen_in_file:
+                    # 防止用户写入文件已经存在的关系
                     dirty = True
                 seen_in_file.add(key)
+                # 装进内存字典 self._relationships
                 self._upsert_edge_in_memory(
                     lt, lc, rt, rc,
                     source=str(item.get("source", "semantic_layer")),
@@ -339,7 +345,7 @@ class SchemaMapEngine:
                 seed_sqls, persist=False, only_new=True
             )
             dirty = dirty or (mined_new > 0)
-
+        # 到现在为止改的都是内存里的_relationships
         # 对账第 3 步：【增量探测新表/改名新列】执行「数据值包含率初筛 + 大模型语义盖章」
         discovered_new = self.discover_hidden_foreign_keys(persist=False)
         dirty = dirty or (discovered_new > 0)
@@ -375,6 +381,7 @@ class SchemaMapEngine:
             new_discovered_count = 0
 
             # Step 2: 扫描各表的非主键候选外键列，计算与各表主键靶子的数据值包含率
+            # 这里可以再唯一列和主键列当中计算覆盖,但是怕有些表不做唯一限制
             for child_table, meta in schema.items():
                 child_pk = pk_targets.get(child_table, "")
                 for col_meta in meta.get("columns", []):
@@ -401,7 +408,8 @@ class SchemaMapEngine:
                         if candidate_key in known_4tuples:
                             continue
 
-                        # 在数据库中计算子表列值落入目标表主键集合的包含率 (Inclusion Dependency Ratio)
+                        # 在 PostgreSQL 实体数仓中计算子表列值落入目标表主键集合的包含率 (若本地未起 PG 则由 postgres_client 内部自动降级)
+                        # CAST(c.child_col AS VARCHAR) 的意思就是：把子表这一列的值，强制转成字符串类型，然后再和父表的值比较。
                         probe_sql = f"""
                         SELECT
                             (SELECT COUNT(DISTINCT {child_col}) FROM {child_table} WHERE {child_col} IS NOT NULL) AS child_dist,
@@ -410,12 +418,12 @@ class SchemaMapEngine:
                         JOIN {target_table} p
                           ON CAST(c.{child_col} AS VARCHAR) = CAST(p.{target_pk} AS VARCHAR)
                         """
-                        res = duckdb_client.query_olap(probe_sql)
+                        res = postgres_client.execute_readonly_query(probe_sql)
                         if res.get("error") or not res.get("rows"):
                             continue
                         row = res["rows"][0]
-                        child_dist = int(row.get("child_dist") or 0)
-                        matched_dist = int(row.get("matched_dist") or 0)
+                        child_dist = int(row.get("child_dist") or 0)# join前字段里值的数量
+                        matched_dist = int(row.get("matched_dist") or 0)# join后字段里值的数量
                         if child_dist == 0 or matched_dist == 0:
                             continue
 
@@ -424,6 +432,7 @@ class SchemaMapEngine:
                             continue
 
                         # Step 3: 数据值包含率达标 (>= 80%)！交由大模型或语义域规则做二分类盖章（防巧合碰撞）
+                        # 光看两列里面的数字一模一样还不行，还得看这两列的名字和中文意思是不是指同一个东西，防止数字纯属巧合撞车
                         if not self._verify_candidate_semantics(
                             child_table, col_meta, target_table, target_pk, schema[target_table]
                         ):
@@ -667,10 +676,36 @@ class SchemaMapEngine:
     def _build_adjacency(
         self, schema: Dict[str, Dict[str, Any]]
     ) -> Tuple[Dict[str, Set[str]], Dict[Tuple[str, str], str], Dict[Tuple[str, str], float]]:
+        # 邻接表,给每张表发个空集合,集合里是关联的表名
+        # adj = {
+        #     "dim_customers": {"fact_orders"},
+        #     "fact_orders":   {"dim_customers", "fact_order_items", "fact_returns", "fact_quality_claims"},
+        #     "fact_returns":  {"fact_orders", "fact_order_items", "dim_products"},
+        #     ...
+        # }
         adj: Dict[str, Set[str]] = {t: set() for t in schema}
+        # edge_join_conditions = {
+        #      1. 单字段关联的两张表（列表里只有 1 个条件）：
+        #     ("dim_customers", "fact_orders"): [
+        #         "dim_customers.customer_id = fact_orders.customer_id"
+        #     ],
+        #
+        #      2. 双字段复合关联的两张表（列表里有 2 个条件！）：
+        #     ("fact_order_items", "fact_returns"): [
+        #         "fact_order_items.order_id = fact_returns.order_id",
+        #         "fact_order_items.product_id = fact_returns.product_id",
+        #     ],
+        # }
         edge_join_conditions: Dict[Tuple[str, str], List[str]] = {}
+        # 权重:verified_count
+        # edge_weights = {
+        #     ("dim_customers", "fact_orders"):     4.08,  # 验证了 7 次的单字段边
+        #     ("fact_orders", "fact_returns"):      3.39,  # 验证了 3 次的单字段边
+        #     ("fact_order_items", "fact_returns"): 4.39,  # 2 个复合字段累加出来的边（权重最高！）
+        # }
         edge_weights: Dict[Tuple[str, str], float] = {}
-
+        # 这个项目是不同Graph
+        # 之前Aider之所以用MultiGraph 是因为那里每一个文件是一个节点,但是真正连线的是内部的函数和类
         for (lt, lc, rt, rc), rel in self._relationships.items():
             if lt not in schema or rt not in schema or lt == rt:
                 continue
@@ -678,13 +713,20 @@ class SchemaMapEngine:
             adj[rt].add(lt)
             cond = f"{lt}.{lc} = {rt}.{rc}"
             freq_boost = 1.0 + math.log1p(int(rel.get("verified_count", 1)))
+            # 双向存 Key、收集复合 JOIN 条件、累加边权重
+            # 把正向 (lt, rt) 和反向 (rt, lt) 同時に写进字典里
             for pair in ((lt, rt), (rt, lt)):
+                # conds是edge_join_conditions复制
                 conds = edge_join_conditions.setdefault(pair, [])
                 if cond not in conds:
                     conds.append(cond)
                 edge_weights[pair] = edge_weights.get(pair, 1.0) + freq_boost
 
         joined_conds = {pair: " AND ".join(conds) for pair, conds in edge_join_conditions.items()}
+        # joined_conds = {
+        #     ("dim_customers", "fact_orders"): "dim_customers.customer_id = fact_orders.customer_id",
+        #     ("fact_orders", "dim_customers"): "dim_customers.customer_id = fact_orders.customer_id",
+        # }会有重复的
         return adj, joined_conds, edge_weights
 
     def compute_table_rank(
@@ -935,59 +977,92 @@ class SchemaMapEngine:
         schema = self.load_schema(force_refresh=force_refresh)# 第一阶段：加载表结构并跑三层漏斗建边
         ranked = self.compute_table_rank(query=query)# 第二阶段：跑 PageRank 选 Top-K 核心表
         score_map = dict(ranked)
-        selected = [t for t, _ in ranked[:top_k]]
 
-        # 第二阶段：1. 迭代 BFS 补全断桥表 + 2. 带权最大生成树划分「默认主干边」与「备选替换边」
-        subgraph = self.resolve_connected_subgraph(selected)
-        final_tables = subgraph["final_tables"]
-        bridge_set = set(subgraph["bridge_tables"])
-        backbone_edges = subgraph["backbone_edges"]
-        alternative_edges = subgraph["alternative_edges"]
+        def _render_candidate_k(k: int) -> Tuple[str, Dict[str, Any]]:
+            """完整渲染前 k 张表（含补桥与完整主干/备选 JOIN 路径），绝不半路截断字符串"""
+            selected_k = [t for t, _ in ranked[:k]]
+            sub = self.resolve_connected_subgraph(selected_k)
+            f_tables = sub["final_tables"]
+            b_set = set(sub["bridge_tables"])
+            b_edges = sub["backbone_edges"]
+            a_edges = sub["alternative_edges"]
 
-        lines = [
-            "## 🗺️ 数仓血缘骨架图 (Schema-Map via Two-Phase Table-Rank)",
-            f"针对查询意图「{query or '全库概览'}」，选出核心表与自动补全桥表共 {len(final_tables)} 张：",
-        ]
-        for rank_idx, t_name in enumerate(final_tables, 1):
-            meta = schema.get(t_name, {})
-            score = score_map.get(t_name, 0.0)
-            bridge_tag = " [自动补全桥表]" if t_name in bridge_set else ""
-            cols = ", ".join(
-                f"{c['name']}({c['type']})" for c in meta.get("columns", [])
-            )
-            lines.append(
-                f"{rank_idx}. **{t_name}** [TableRank={score:.3f}]{bridge_tag} — {meta.get('description', '')}\n"
-                f"   - 主键: `{meta.get('primary_key', 'id')}` | 字段: {cols}"
-            )
+            md_lines = [
+                "## 🗺️ 数仓血缘骨架图 (Schema-Map via Two-Phase Table-Rank)",
+                f"针对查询意图「{query or '全库概览'}」，选出核心表与自动补全桥表共 {len(f_tables)} 张：",
+            ]
+            for rank_idx, t_name in enumerate(f_tables, 1):
+                meta = schema.get(t_name, {})
+                score = score_map.get(t_name, 0.0)
+                bridge_tag = " [自动补全桥表]" if t_name in b_set else ""
+                cols = ", ".join(
+                    f"{c['name']}({c['type']})" for c in meta.get("columns", [])
+                )
+                md_lines.append(
+                    f"{rank_idx}. **{t_name}** [TableRank={score:.3f}]{bridge_tag} — {meta.get('description', '')}\n"
+                    f"   - 主键: `{meta.get('primary_key', 'id')}` | 字段: {cols}"
+                )
 
-        if backbone_edges:
-            lines.append("\n### 🌲 1. 默认主干连法（无环生成树，已连通上方所有表，常规查询直接选用）：")
-            for edge_str in backbone_edges:
-                lines.append(f"- {edge_str}")
+            if b_edges:
+                md_lines.append("\n### 🌲 1. 默认主干连法（无环生成树，已连通上方所有表，常规查询直接选用）：")
+                for edge_str in b_edges:
+                    md_lines.append(f"- {edge_str}")
 
-        if alternative_edges:
-            lines.append(
-                "\n### 🔄 2. 备选替换连法（细粒度/复合键替代边 — 需按细粒度关联时用于【替换】上方对应主干，严禁与主干同时堆叠形成三角形环路！）："
-            )
-            for edge_str in alternative_edges:
-                lines.append(f"- {edge_str}")
+            if a_edges:
+                md_lines.append(
+                    "\n### 🔄 2. 备选替换连法（细粒度/复合键替代边 — 需按细粒度关联时用于【替换】上方对应主干，严禁与主干同时堆叠形成三角形环路！）："
+                )
+                for edge_str in a_edges:
+                    md_lines.append(f"- {edge_str}")
 
-        if subgraph["unreachable_tables"]:
-            lines.append(
-                f"\n⚠️ 全库孤立表提示：{subgraph['unreachable_tables']} 与其他表无任何外键关联。"
-            )
+            if sub["unreachable_tables"]:
+                md_lines.append(
+                    f"\n⚠️ 全库孤立表提示：{sub['unreachable_tables']} 与其他表无任何外键关联。"
+                )
 
-        rendered = "\n".join(lines)[:token_budget_chars]
+            return "\n".join(md_lines), sub
+
+        # 二分查找：在 [1, min(len(ranked), top_k)] 范围内试探能完整塞进 token_budget_chars 的最大表数 k
+        # 宁可少选 1~2 张边缘表，也绝不一刀切砍断最底部的 JOIN ON 连表路径！
+        max_k = max(1, min(len(ranked), int(top_k or 5)))
+        low, high = 1, max_k
+        best_rendered = ""
+        best_sub: Optional[Dict[str, Any]] = None
+
+        while low <= high:
+            mid = (low + high) // 2
+            candidate_text, candidate_sub = _render_candidate_k(mid)
+            if len(candidate_text) <= token_budget_chars:
+                best_rendered = candidate_text
+                best_sub = candidate_sub
+                low = mid + 1   # 还能装得下，尝试扩大 k
+            else:
+                high = mid - 1  # 超出预算，缩小 k
+
+        # 若极端情况下连 k=1 都超出预算，保底取 k=1 的完整结构（不截断 JOIN 路径）
+        if best_sub is None:
+            best_rendered, best_sub = _render_candidate_k(1)
+
+        final_tables = best_sub["final_tables"]
+        bridge_set = set(best_sub["bridge_tables"])
+        backbone_edges = best_sub["backbone_edges"]
+        alternative_edges = best_sub["alternative_edges"]
+
         return {
+            # 完整表清单
             "ranked_tables": [
                 {"table": t, "score": round(score_map.get(t, 0.0), 4), "is_bridge": t in bridge_set}
                 for t in final_tables
             ],
+            # 第 2 步算出来的默认主干 JOIN ON 边
             "backbone_edges": backbone_edges,
+            # 会形成三角形/环路的备选替换 JOIN ON 边
             "alternative_edges": alternative_edges,
             "join_paths": backbone_edges + alternative_edges,
+            # 全库血缘图里当前一共沉淀了多少条有效字段关系
             "persisted_relationships_count": len(self._relationships),
-            "schema_map_markdown": rendered,
+            # 经过二分查找控字数后，拼好的最终 Markdown 文本
+            "schema_map_markdown": best_rendered,
         }
 
 
