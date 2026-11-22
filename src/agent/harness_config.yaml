@@ -1,0 +1,68 @@
+# ============================================================
+# DataMind-Harness 工作流声明式配置（DSL）
+# Planning → Executing → Review → Result 四阶段与数据一致性质检标准
+# ============================================================
+
+phases:
+  - name: planning
+    label: "📝 规划中"
+  - name: executing
+    label: "⚙️ 分析执行中"
+  - name: reviewing
+    label: "🔍 数据质检中"
+  - name: result
+    label: "📊 分析完成"
+
+review:
+  mode: auto                 # auto / always / never；auto 对简单问候跳过 grader
+  strategy: hybrid           # hybrid：明确场景走规则，模糊场景走轻量路由模型
+  router_provider: deepseek
+  jev_min_confidence: 0.0
+  router_timeout_seconds: 8
+  max_iterations: 3          # 单次 rubric 最多评审迭代次数（写操作由 SafeRubricMiddleware 强制锁为 1）
+  model: null
+  min_length: 45
+
+# 任务类型识别关键词（用于自动选择 rubric）
+task_types:
+  sql_extraction:
+    keywords: [查询, 取数, SQL, 表结构, 血缘, 明细, 汇总, 排名, Top, 销售额, 订单]
+  statistical_analysis:
+    keywords: [分析, 归因, 为什么, 暴跌, 下滑, 增长, 预测, 趋势, 相关性, 异常, 净利率, 毛利, 退货率]
+  visualization:
+    keywords: [图表, 可视化, 画图, 折线图, 柱状图, 雷达图, 瀑布图, 饼图, 看板, ECharts]
+  data_writeback:
+    keywords: [写回, 标记, 更新状态, 暂停, 冻结, 导出, 审批, 修改]
+
+# 各任务类型的 Grader 质检标准
+rubrics:
+  default: |
+    1. 完整回答用户的数据分析问题，未遗漏关键维度
+    2. 涉及业务数字时有真实的 SQL / DuckDB 工具执行结果作为证据，严禁编造数字
+    3. 输出使用清晰的 Markdown 格式，多行对比数据使用表格展示
+    4. 金额与比率保留两位小数，日期格式规范
+    5. 结论与上游工具返回的数据严格一致
+
+  sql_extraction: |
+    1. 多表关联查询前调用了 inspect_schema_map 确认表结构与最短 JOIN ON 路径，未臆造外键
+    2. 使用了 execute_readonly_sql 或 query_duckdb_olap 获取真实数据
+    3. SQL 查询结果中的核心数值与最终正文表格完全吻合
+
+  statistical_analysis: |
+    1. 结合数仓工具提取了真实业务数据（如订单、退货、库存、供应商维度）
+    2. 对指标变化（如利润率下滑、退货激增）给出了有数据支撑的归因拆解
+    3. 如涉及趋势预测或重型统计，调用了 submit_heavy_analytics_job 或沙箱计算
+    4. 给出了可量化、可落地的业务决策建议
+
+  visualization: |
+    1. 在获取真实数据的基础上调用了 generate_echarts_schema 或 generate_chart 生成可视化配置
+    2. 图表类型符合数据特征或用户的 WARM 记忆图表偏好
+    3. 图表中的数据点与正文分析结论完全一致
+
+  data_writeback: |
+    1. 写回或状态变更前已基于数据查询确认了目标记录的主键与现状
+    2. 调用了受人工审批保护的 execute_writeback_sql 或 export_sensitive_data 工具
+    3. 清晰说明了变更影响范围与审计依据，未绕过 HITL 审批
+
+observability:
+  trace_phase_transitions: true
