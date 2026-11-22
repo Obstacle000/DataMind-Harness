@@ -123,6 +123,19 @@ DEFAULT_WAREHOUSE_SCHEMA: Dict[str, Dict[str, Any]] = {
             {"column": "product_id", "ref_table": "dim_products", "ref_column": "product_id"},
         ],
     },
+    "fact_quality_claims": {
+        "description": "供应商质量索赔孤岛表（无物理外键、无历史SQL、字段异名：ord_ref_no / vendor_code）",
+        "primary_key": "claim_id",
+        "columns": [
+            {"name": "claim_id", "type": "BIGINT", "comment": "索赔单唯一主键"},
+            {"name": "ord_ref_no", "type": "BIGINT", "comment": "关联业务订单号（异名外键，未建物理约束）"},
+            {"name": "vendor_code", "type": "BIGINT", "comment": "责任供应商编码（异名外键，未建物理约束）"},
+            {"name": "claim_region", "type": "VARCHAR(32)", "comment": "发生大区（低基数维度列）"},
+            {"name": "claim_amount", "type": "NUMERIC(14,2)", "comment": "质量索赔扣款金额"},
+            {"name": "claim_status", "type": "VARCHAR(32)", "comment": "索赔状态"},
+        ],
+        "foreign_keys": [],  # 无物理外键，由第一阶段第 3 层（数据值包含率 + 大模型语义盖章）自动探查发现！
+    },
 }
 
 

@@ -153,6 +153,23 @@ _SEED_SQL_STATEMENTS = [
     (7003, 303, '华南', 90, 0, '2026-11-20'),
     (7004, 304, '华北', 25, 0, '2026-11-20');
     """,
+    """
+    CREATE TABLE IF NOT EXISTS fact_quality_claims (
+        claim_id INTEGER PRIMARY KEY,
+        ord_ref_no INTEGER,
+        vendor_code INTEGER,
+        claim_region VARCHAR(32),
+        claim_amount DOUBLE,
+        claim_status VARCHAR(32)
+    );
+    """,
+    "DELETE FROM fact_quality_claims;",
+    """
+    INSERT INTO fact_quality_claims VALUES
+    (8001, 1001, 203, '华东', 4500.0, 'settled'),
+    (8002, 1004, 203, '华东', 18000.0, 'pending'),
+    (8003, 1005, 204, '华东', 12500.0, 'settled');
+    """,
 ]
 
 

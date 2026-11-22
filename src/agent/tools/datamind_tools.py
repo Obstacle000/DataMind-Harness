@@ -66,7 +66,10 @@ def execute_readonly_sql(sql: str, limit: int = 200) -> str:
         return json.dumps(cached, ensure_ascii=False, indent=2)
 
     result = postgres_client.execute_readonly_query(sql, limit=max(1, min(int(limit or 200), 1000)))
-    redis_client.set_sql_cache(sql, result, engine="pg")
+    if not result.get("error"):
+        redis_client.set_sql_cache(sql, result, engine="pg")
+        # 运行时自学习：将成功执行的 SQL 中的 JOIN 关系动态沉淀到 Schema-Map 血缘图谱
+        schema_map_engine.learn_from_executed_sql(sql)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -90,7 +93,9 @@ def query_duckdb_olap(sql: str, limit: int = 500) -> str:
         return json.dumps(cached, ensure_ascii=False, indent=2)
 
     result = duckdb_client.query_olap(sql, limit=max(1, min(int(limit or 500), 2000)))
-    redis_client.set_sql_cache(sql, result, engine="duckdb")
+    if not result.get("error"):
+        redis_client.set_sql_cache(sql, result, engine="duckdb")
+        schema_map_engine.learn_from_executed_sql(sql)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
