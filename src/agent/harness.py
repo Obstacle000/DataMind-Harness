@@ -350,6 +350,70 @@ class HarnessPhaseMiddleware(AgentMiddleware):
     阶段字段写入 state，供 chat.py 从 values 流读取并向前端发射结构化 SSE 事件，
     替代原先对 LLM 输出文本的正则猜测。
     """
+    # 在以前我手动连线的时候是限定了每一个模型的输出 然后手动放进state里的
+    # 那如果我想实现调用工具后,或者模型输出后更新state该怎么操作?
+    # 首先明确deepagents和之前的图连线使用state的方式不同
+    # 它遍历 middleware 列表里每一个中间件，把大家各自声明的 state_schema
+    # （比如 TodoListMiddleware 的 todos、HarnessPhaseMiddleware 的 phase/plan、RubricMiddleware 的 _rubric_status）
+    # 全部合并成一张总 MergedState，然后再传给 StateGraph(MergedState) 编译
+    # 比如mid_A里定义Astate,mid_B里定义Bstate,如果顺序是A->B,B里也可以使用更新AState,A也能用Bstate,因为编译的时候先合并成大state了
+    # 不像之前那样分输出输出state
+    # 模型输出后修改state你已经实现了,就是中间件里声明挂上state,然后钩子函数直接返回state里的字典
+    # 工具的话,也需要在某一个中间件里挂上state,然后工具内部需要使用Command( update={...})来修改字段
+    # 只有当某个信息需要跨轮次驱动后续中间件/路由逻辑,且跨轮次不被压缩时，才值得写进自定义 state,比如todos；
+    # 单纯给大模型看的查询结果，放进 ToolMessage 就够了,就比如数据库大纲
+    # 全局state:
+    # state = {
+    #     # ================= 1. LangGraph 基座自带 =================
+    #     "messages": [
+    #         HumanMessage("查一下上月各区域毛利"),
+    #         AIMessage(tool_calls=[...]),
+    #         ToolMessage("...SQL 查询结果..."),
+    #         AIMessage("上月华东区毛利最高..."),
+    #     ],
+    #
+    #     # ================= 2. DeepAgents 内置中间件贡献 =================
+    #     # 来自 TodoListMiddleware（write_todos 工具直接改这里）
+    #     "todos": [
+    #         {"content": "获取数仓血缘骨架", "status": "completed"},
+    #         {"content": "执行只读 SQL 统计各区域毛利", "status": "in_progress"},
+    #     ],
+    #     # 来自 FilesystemMiddleware（文件工作区虚拟状态）
+    #     "files": {},
+    #
+    #     # ================= 3. 咱们自定义的 HarnessPhaseState (harness.py#L122-L145) =================
+    #     "phase": "executing",            # 当前阶段: planning / executing / reviewing / result
+    #     "plan": {"steps": [...]},        # 从 todos 同步过来的结构化 Plan 快照
+    #     "review_decision": {             # 审查路由器本轮决策（审/跳过、命中哪个 task_type）
+    #         "decision": "review",
+    #         "task_type": "sql_extraction",
+    #         "reason": "...",
+    #     },
+    #     "review_result": {               # 最终质检报告（持久化并供前端展示）
+    #         "verdict": "satisfied",
+    #         "explanation": "...",
+    #         "criteria": [...],
+    #         "iteration": 1,
+    #     },
+    #     "_harness_rubric_source": "auto",# 私有字段：标记 rubric 是自动注入的，下轮简单闲聊时自动清空
+    #     "_review_start": 4,              # 本轮对话在 messages 里的起始切片下标
+    #     "_review_write_attempted": False,# ReviewExecutionGate 写锁：本轮是否触发过写库/导出，防打回重复写
+    #     "_review_signals": [],           # 运行时捕获的工具报错/异常特征信号
+    #
+    #     # ================= 4. 质检中间件 SafeRubricMiddleware 贡献 =================
+    #     "rubric": "1. 数据来自真实 SQL...\n2. 口径正确...",  # 本轮生效的评审标准
+    #     "_rubric_status": "satisfied",   # 当前评审判定: satisfied / needs_revision / failed
+    #     "_rubric_evaluations": [...],    # 历次评审打分明细列表
+    #     "_rubric_iteration": 1,          # 当前已打回重试次数（配合 max_iterations 防死循环）
+    #
+    #     # ================= 5. 中断时 LangGraph 临时注入 =================
+    #     # "__interrupt__": [...]         # 仅在命中 interrupt_on 挂起等待人工审批时出现
+    # }
+    # 某一个信息放进state还是toolmessage这个怎么敲定?
+    # 只给大模型看的“过程素材” → 放 ToolMessage；
+    # 要给“代码（中间件 / 路由 / 前端固定组件）”读的结构化状态，或者需要“覆盖更新”的最新快照 → 放 自定义 State 字段。
+    # 像之前把repomap放进state也不能说是错误做法,因为那时候一次对话只需要经过一次图,不像现在这么循环
+    # 所以state自然越详细越好,但是这里的话很多信息都是一次性的,直接放进toolmessage里就好了
 
     state_schema = HarnessPhaseState
     # router_model由JevRouter提供

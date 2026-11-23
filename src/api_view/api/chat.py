@@ -8,6 +8,25 @@
 - display_messages 实时累积（用户消息 + 助手回复 + 工具调用）
 - SSE 事件协议: token / tool_start / tool_args / tool_result / tool_end / interrupt / done
 """
+# sse_event类型
+# 正文与思考
+# thinking：流开始时发 {"status": "start"} 让前端转圈；收到第 1 个正文 token 或工具调用时发 {"status": "end"} 关掉转圈。
+# token：大模型逐字输出的正文内容，带 content 和来源 source（main / schema-engineer / python-scientist / report-narrator）。
+# 2. 工具调用生命周期
+# tool_start：开始调用某个工具，带 name 和 id。
+# tool_args：工具参数的流式 JSON 分片。
+# tool_result：工具执行完返回的结果（截断前 2000 字）。
+# tool_end：该 id 对应的工具卡片结束运行。
+# 3. Harness 治理与状态
+# phase：阶段切换（thinking / planning / executing / reviewing / result 及中文 label）。
+# todo_update：write_todos 任务清单有变动时，推送最新 TODO 列表和勾选状态。
+# review_result：Rubric 质检评审器的打分判定结果（verdict、explanation、criteria、iteration）。
+# 4. 交互与可视化
+# chart_component：DataMind 新增，调用 generate_echarts_schema 后向前端直接下发交互式 ECharts 图表 JSON（Generative UI）。
+# interrupt：高危工具触发人工审批挂起，通知前端弹出审批卡片（如 hitl_approval）。
+# 5. 流控制与异常
+# error：后端抛未捕获异常时推送错误提示。
+# done：本次 SSE 流结束信号，带 thread_id 和 interrupted: True/False。
 import json
 import uuid
 from typing import AsyncGenerator
@@ -83,13 +102,19 @@ async def stream_chat_response(
         })
         current_input = {"messages": [{"role": "user", "content": message}]}
 
-    # 当前助手消息累积缓冲
+    # 把每次收到的文本 token 拼接成完整回复。
     assistant_content = ""
+    # 记录这轮调了哪些工具（name、流式拼起来的 args、执行完填进去的 result、running → done 状态）。
     tool_calls_buffer = []
+    # 流一开始发了 thinking: start 让前端转圈；等第 1 个正文 token 或工具调用到来时，发一次 thinking: end 关掉转圈，然后把开关置 True，避免后面每个字都重复发。
     thinking_emitted = False
+    # 记录当前 Harness 阶段
     phase = "thinking"  # 当前阶段: thinking → planning → executing → reviewing → result
+    # 只有 new_phase != last_phase 时才发 event: phase 更新前端顶部的状态胶囊。
     last_phase = "thinking"  # 上次已发射的阶段（去重）
+    # last_todos_sig = None：把 todos 列表转成 JSON 字符串当“指纹”；只有 TODO 内容或勾选状态真变了（todos_sig != last_todos_sig），才发 event: todo_update。
     last_todos_sig = None  # 上次已发射的 todo 列表签名（去重）
+    # 对审查路由决策 review_decision 做 JSON 指纹去重，防止同一条决策被重复记录。
     last_review_sig = None
     harness_trace: list = []  # Harness 阶段流转 trace（P3 可观测）
 
@@ -119,6 +144,7 @@ async def stream_chat_response(
             subgraphs=True,
         ):
             # ===== 中断检测 + 结构化 Harness 状态读取（必须在 messages 处理之前）=====
+            # 每跑完一个图节点（Super-step）、状态合并进 state 的那一刻，stream_mode="values" 就会立刻吐出整份最新 state 的 chunk。
             if chunk_type == "values":
                 if isinstance(chunk, dict):
                     if not namespace and chunk.get("review_decision"):
@@ -149,7 +175,9 @@ async def stream_chat_response(
                     # --- 结构化 todo 列表（来自 TodoListMiddleware 的 write_todos 状态）---
                     todos = chunk.get("todos")
                     if todos is not None:
-                        # 判断todos是否发生变动
+                        # 这个chunk是tools 节点刚执行完 write_todos 工具,更新state的那一刻发出来的
+                        # 所以此时harness还没改Plan
+                        # 这里判断todos是否发生变动告知前端
                         todos_sig = json.dumps(todos, ensure_ascii=False, sort_keys=True)
                         if todos_sig != last_todos_sig:
                             last_todos_sig = todos_sig
@@ -267,6 +295,7 @@ async def stream_chat_response(
 
                 # AIMessage with tool_call_chunks → tool_start / tool_args
                 if tool_call_chunks:
+                # 此时是 Model 节点在流式吐 AIMessageChunk（大模型刚决定要调哪个工具，工具还没开始执行）
                     # 首次收到工具调用时结束 thinking 状态
                     # 为什么第 1 个 Token 来时发射 thinking: {status: "end"}？
                     # 大模型（尤其是带思考链的模型）在回答前会有几秒钟的“思考延迟”。
@@ -277,6 +306,7 @@ async def stream_chat_response(
                         thinking_emitted = True
                     for tc in tool_call_chunks:
                         if isinstance(tc, dict):
+                            # 记录tc
                             if tc.get("name"):
                                 tool_calls_buffer.append({
                                     "id": tc.get("id", str(uuid.uuid4())),
@@ -296,12 +326,17 @@ async def stream_chat_response(
                     continue
 
                 # ToolMessage → tool_result / tool_end
+                # 等大模型把参数吐完，LangGraph 切到 Tools 节点真正去跑这个工具（耗时几百毫秒到几秒）。
+                # 工具跑完后（无论是正常查出数据，还是报错返回异常信息），Tools 节点会吐出一个 ToolMessage
+                # 与if tool_call_chunks互斥,这个是大模型toolcall,下面是调用完毕
                 if token_type == "tool":
                     tool_name = getattr(token, "name", "unknown")
                     tool_content = content if isinstance(content, str) else str(content)
                     # 更新 buffer 中对应工具的状态
                     for tc in tool_calls_buffer:
                         if tc["name"] == tool_name and tc["status"] == "running":
+                            # 截取前 1000 字（tool_content[:1000]）更新进 tool_calls_buffer
+                            # 由于chunk(tool)比
                             tc["result"] = tool_content[:1000]
                             tc["status"] = "done"
                             break

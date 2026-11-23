@@ -16,7 +16,10 @@ from .web_config import get_db
 @dataclass
 class AgentSession:
     """一个用户独享的 Agent、稳定沙箱 Proxy 与串行运行锁。"""
-
+    # gent 自己的聊天记录,会话记录和状态全在 MongoDB，运行时的 session 对象在内存里，而 PostgreSQL 存的是“被分析的企业业务数仓数据”，根本不存聊天记录
+    # session对象的作用是存个人agent和隔离容器
+    # 由于聊天记录和状态都在mongo,后端重启也不会丢失会话记录和上下文
+    # session里最重要的是就是由creat_main_agent创建出来的agent,里面实现了隔离容器沙箱,熔断记录还有各种的初始化
     user_id: str
     username: str
     agent: Any
@@ -136,6 +139,7 @@ class AgentLoader:
     async def get_session(self, user_id: str, username: str = "用户") -> AgentSession:
         """获取用户独享的 Agent 会话，避免不同用户共享 Sandbox/中间件状态。"""
         await self._ensure_resources()
+        # 挂起结束后事件循环不会立马调度挂起的协程,而是把他放进事件循环等待当前执行的协程遇到await后才会执行
 
         if self._sessions_lock is None:
             self._sessions_lock = asyncio.Lock()
@@ -214,6 +218,7 @@ class AgentLoader:
 
     async def get_display_messages(self, thread_id: str) -> list:
         """获取前端展示消息"""
+
         db = get_db()
         doc = await db.display_messages.find_one({"thread_id": thread_id})
         return doc.get("messages", []) if doc else []
