@@ -82,19 +82,12 @@ def pseudonym(value):
     return hmac.new(key.encode(), str(value).encode(), hashlib.sha256).hexdigest()[:32]
 
 # 链路追踪器 - 底层接入的是大模型领域最主流的开源 APM 平台：Langfuse(开源版langsmith)。
-# 用户发起对话请求 (chat.py)
-#    │
-#    ├── 1. @traced_stream 拦截器启动：
-#    │      创建 Trace(user_id, thread_id) 根跨度，并存入 ContextVar('erp_trace')
-#    │
-#    ├── 2. Agent 运行中触发 @measured('skills.read')：
-#    │      自动从 ContextVar 里拿出当前请求的 Trace，上报技能读取耗时
-#    │
-#    ├── 3. MetadataCallback 自动监听图执行：
-#    │      自动记录 model.call (消耗的 Token)、tool.* (工具调用)
-#    │
-#    └── 4. 请求结束：
-#           Trace.finish() 将整条完整的瀑布流链路数据异步推送到 Langfuse 服务端
+# 流程:
+# @traced_stream 修饰stream_chat_response 初始化Trace,调用start_observation开启根节点root
+#   traced_config把回调器放进运行时配置里
+#   @measured/event() - 瞬时打点,调用start()不传parent_id,开辟根节点写第一层节点,span开启后更新,立马关闭soan,传入name,和自定义字段
+#   内部官方源码自动调用on_方法,回调我自己写的on_方法,遇到on_start(),调用start(),传parent_id,开辟非第一层子节点,遇到on_end(),调用span.end()
+# 调用finish()关闭root根节点,reset恢复trace
 class Trace:
     def __init__(self, user, thread, resume=False):
         self.client = client() # Langfuse实例
@@ -128,7 +121,9 @@ class Trace:
             return self.client.start_observation(name=name, as_type='generation' if generation else 'span',
                 trace_context={'trace_id': self.root.trace_id, 'parent_span_id': (parent or self.root).id})
         except Exception: return None
-    # 记录一个瞬间事件（即刻打点）
+    # 记录一个瞬间事件（即刻打点）,看内部start完后直接就end关闭span了,@measured也是瞬时打点,内部调用event,但是开启的都是根节点下第一层节点
+    # 长事件只有两处,一处是traced_stream包裹的stream_chat_response,初始化Trace,创建根节点,内部会监听每一个yield出的sse事件,直到方法结束调用finish()关闭根节点
+    # 还有一处就是回调器内部根据on_方法回调,此时遇到on_..._start调用start()开启子节点,此时不是根节点下第一层节点
     def event(self, name, **numbers):
         # 用event追踪的,默认都是根节点下的“第一层（一级子节点）”
         # 这里不传根节点的id,说明默认父节点就是根节点
@@ -153,6 +148,48 @@ def event(name, **numbers):
     # 属性是自定义的
     # 属性值只能传数值（int、float）或布尔值（bool）
     if trace: trace.event(name, **numbers)
+
+
+class SpanTimer:
+    """可跨异步迭代手动闭合、也可直接 with / async with 的计时 Span。"""
+    # 用的时候先start_span返回SpanTimer,然后with或者async with
+    # 或者手动 调用finish关闭(建议)
+    def __init__(self, span):
+        self._span = span
+        self._started = time.perf_counter()
+        self._closed = False
+
+    def finish(self, **numbers):
+        if self._closed:
+            return
+        self._closed = True
+        if self._span:
+            try:
+                meta = {k: v for k, v in numbers.items() if isinstance(v, (int, float, bool))}
+                meta.setdefault("duration_ms", (time.perf_counter() - self._started) * 1000)
+                self._span.update(metadata=meta)
+                self._span.end()
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.finish(failed=exc_type is not None)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.finish(failed=exc_type is not None)
+
+
+def start_span(name, parent=None, generation=False) -> SpanTimer:
+    """开启一个持续计时 Span（支持跨迭代 .finish(...) 或 async with 自动闭合）。"""
+    trace = _current.get()
+    span = trace.start(name, parent=parent, generation=generation) if trace else None
+    return SpanTimer(span)
 
 # def deco(func):
 #     def wrapper(*args, **kwargs):

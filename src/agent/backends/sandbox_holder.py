@@ -41,6 +41,7 @@ def get_sandbox(user_id: str | None = None) -> Any | None:
 
 def bind_sandbox(user_id: str) -> Token[Any | None]:
     """将某位用户的沙箱绑定到当前协程，返回可在 finally 中复位的 token。"""
+    # 就是可能某一个请求执行某一个逻辑的时候拿不到userid,此时就可以从协程上下文变量里直接取出了
     with _registry_lock:
         sandbox = _sandboxes_by_user.get(user_id)
     return _request_sandbox.set(sandbox)

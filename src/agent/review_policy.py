@@ -118,7 +118,9 @@ def reset_grading(rubric=""):
 
 # 组装评审标准
 def compose_rubric(route, config):
+    # harness_config.rubrics
     template = config.get("rubrics", {}).get(route.task_type, "")
+    # 构建ReviewRoute是可以按需选择checks字段
     checks = "\n".join(CHECKS[key] for key in dict.fromkeys(route.checks))
     return BASELINE + "\n仅在本轮任务适用时检查：\n" + template + "\n" + checks
 
@@ -172,11 +174,15 @@ class ReviewPolicy:
         return ReviewRoute(decision="review", reason="路由不可用或输出无效，保守审查")
 
     def finish(self, state, route, source):
+        # 是不是“外部调用方本轮亲手显式传入的”，而不是上一轮系统自动留下的历史残留？
         explicit = bool(state.get("rubric")) and not state.get("_harness_rubric_source") and not state.get("_active_rubric")
         # state["rubric"]一开始肯定是空的,是在这里compose后循环拿到的
+        # 只要 route.decision != "skip"（即 "review" 或 "uncertain"），就调用 compose_rubric 拼出质检标准；否则 rubric = ""
         rubric = state["rubric"] if explicit else (compose_rubric(route, self.config) if route.decision != "skip" else "")
         if explicit:
             source = "explicit"
+        #  rubric 就统一覆盖写成 "review"，没 rubric 就写成 "skip"
+        # 就算开局误判成了 "skip",如果ReviewExecutionGate 发现调用了工具之类的,会升级
         decision = {**route.model_dump(), "decision": "review" if rubric else "skip", "source": source}
         update = {
             # ===== 【本项目自定义的 Harness 扩展字段】（共 5 个）=====
@@ -189,6 +195,7 @@ class ReviewPolicy:
             **reset_grading(rubric)  # 解包出 _rubric_iterations 等 6 个字段
         }
         if not explicit and (rubric or state.get("rubric") or state.get("_harness_rubric_source")):
+            # 这里把rubric字段传入进state
             update.update(rubric=rubric, _harness_rubric_source="auto" if rubric else "")
         agent_logger.info(f"Review route: {decision['decision']} ({source})")
         return update

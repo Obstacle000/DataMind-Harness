@@ -58,7 +58,7 @@ PHASE_LABELS = {
 }
 
 
-from ...agent.observability import traced_stream, traced_config, event
+from ...agent.observability import traced_stream, traced_config, event, start_span
 
 
 @traced_stream
@@ -116,7 +116,9 @@ async def stream_chat_response(
     last_todos_sig = None  # 上次已发射的 todo 列表签名（去重）
     # 对审查路由决策 review_decision 做 JSON 指纹去重，防止同一条决策被重复记录。
     last_review_sig = None
+    # 专门用来按时间顺序记下 Agent 这轮的控制流轨迹,专门用来按时间顺序记下 Agent 这轮的控制流轨迹
     harness_trace: list = []  # Harness 阶段流转 trace（P3 可观测）
+    grader_span = None        # 评审器持续计时 Span（跨越 start / end 两次异步迭代）
 
     # 同一用户的整个流串行运行，避免两个会话同时覆盖 /tmp、/workspace 中的文件。
     # ContextVar 让图表、文档、Skill 工具在并发用户之间取到正确的稳定 Proxy。
@@ -131,8 +133,17 @@ async def stream_chat_response(
     await session.run_lock.acquire()
     # 直接用event追踪默认都是根节点下的“第一层（一级子节点）”
     event('request.lock_wait', duration_ms=(time.perf_counter()-lock_started)*1000)
+    # 给这个用户的 Docker 沙箱容器挂一块不准杀的提示
+    # 因为后台巡检隔一段时间就会跑 cleanup_idle_sandboxes() 把闲置超时的 Docker 容器删掉以省内存
+    # 如果某个用户的沙箱在跑一个几分钟的脚本误杀就不好了
     lease_acquired = sandbox_manager.acquire_lease(user_id)
+    # 沙箱是用户从预热器认领的,需要放进上下文使用
+    # 还记得creat_main_aagent里调用过set_sandbox存代理沙箱吗,此时放进内存字典里了
+    # 这里是去除然后放进_request_sandbox这个ContextVar
+    # ContextVar.set() 返回一个 Token 对象,主要用于后续的恢复操作
+    # 取出的时候优先从ContextVar取,没有的话就用userid从内存字典取
     sandbox_token = bind_sandbox(user_id)
+    # 把当前请求的 user_id 和 MongoDBStore（agent_loader.store） 塞进另外两个 ContextVar
     runtime_tokens = bind_runtime(user_id, agent_loader.store)
 
     try:
@@ -147,10 +158,14 @@ async def stream_chat_response(
         ):
             # ===== 中断检测 + 结构化 Harness 状态读取（必须在 messages 处理之前）=====
             # 每跑完一个图节点（Super-step）、状态合并进 state 的那一刻，stream_mode="values" 就会立刻吐出整份最新 state 的 chunk。
+            # 而updates 模式是增量更新,只会产出更新的字段
             if chunk_type == "values":
+                # 如果某个子图的 state 是用 Pydantic BaseModel 定义的，吐出来的 chunk 就是对象而不是 dict
                 if isinstance(chunk, dict):
                     if not namespace and chunk.get("review_decision"):
+                        # 这个字段是在HarnessPhaseMiddleware.before_agent 产生,通过正则和jev_router判断路由
                         decision = chunk["review_decision"]
+                        # state["review_decision"]不只存了decision,存了包括ReviewRoute全部字段和decision+resource
                         event('review.decision', review=decision.get('decision')=='review')
                         signature = json.dumps(decision, ensure_ascii=False, sort_keys=True)
                         if signature != last_review_sig:
@@ -216,6 +231,8 @@ async def stream_chat_response(
                                         "message": interrupt_value.get("message", ""),
                                         "extracted_data": interrupt_value.get("current_data", {}),
                                     })
+                                # 框架内置的 HumanInTheLoopMiddleware 自动调 interrupt(...) 塞进去的固定格式
+                                # {"action_requests": [{"name": "execute_writeback_sql", "args": {"sql": "UPDATE ..."}}], "review_configs": [...]}
                                 elif "action_requests" in interrupt_value:
                                     yield sse_event("interrupt", {
                                         "interrupt_type": "hitl_approval",
@@ -241,25 +258,37 @@ async def stream_chat_response(
                                 "toolCalls": tool_calls_buffer,
                                 "timestamp": datetime.now().isoformat(),
                             })
+                        # 保存message,等下一次中断回复请求
                         await agent_loader.save_display_messages(thread_id, display_messages)
+                        # 这个跟Trace没关系,只是保存在mongodb
                         await agent_loader.save_harness_trace(thread_id, harness_trace)
                         yield sse_event("done", {"thread_id": thread_id, "interrupted": True})
                         return
                 continue
 
             # ===== Custom 流处理（评审器等中间件的结构化事件）=====
+            # 整个项目目前唯一产出 custom 流的地方，是第三方包 RubricMiddleware（被咱们的 SafeRubricMiddleware 继承）的内部源码
             if chunk_type == "custom":
                 if isinstance(chunk, dict):
                     ev_type = chunk.get("type", "")
                     if ev_type == "rubric_evaluation_start":
-                        event('grader.start')
+                        # 开启持续计时 Span（若上一轮有未闭合残留先兜底关掉）
+                        if grader_span is not None:
+                            grader_span.finish(aborted=True)
+                        grader_span = start_span('grader.evaluate')
                         # 评审器开始 grading → 进入审查阶段
                         if phase != "reviewing":
                             phase = "reviewing"
                             last_phase = "reviewing"
                             yield sse_event("phase", {"phase": "reviewing", "label": "🔍 审查中"})
                     elif ev_type == "rubric_evaluation_end":
-                        event('grader.end', satisfied=chunk.get('result')=='satisfied', iteration=chunk.get('iteration',0))
+                        satisfied = chunk.get('result') == 'satisfied'
+                        iteration = chunk.get('iteration', 0)
+                        if grader_span is not None:
+                            grader_span.finish(satisfied=satisfied, iteration=iteration)
+                            grader_span = None
+                        else:
+                            event('grader.evaluate', satisfied=satisfied, iteration=iteration)
                         # 评审器产出结构化判定 → 发射 review_result 事件
                         review_data = {
                             "verdict": chunk.get("result", ""),
@@ -424,6 +453,8 @@ async def stream_chat_response(
         yield sse_event("error", {"message": f"服务内部错误: {str(e)[:200]}"})
         yield sse_event("done", {"thread_id": thread_id, "interrupted": False})
     finally:
+        if grader_span is not None:
+            grader_span.finish(aborted=True)
         reset_runtime(runtime_tokens)
         reset_sandbox(sandbox_token)
         if lease_acquired:
