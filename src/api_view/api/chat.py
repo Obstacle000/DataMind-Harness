@@ -125,9 +125,11 @@ async def stream_chat_response(
     from ...agent.runtime_context import bind_runtime, reset_runtime
 
     import time
+    # 一个高精度秒表，用来统计“当前请求等 session.run_lock 这把锁排了多少毫秒的队”，然后上报给可观测性监控
     lock_started = time.perf_counter()
     # 防止同一个用户两个会话同时覆盖 /tmp、/workspace 中的文件
     await session.run_lock.acquire()
+    # 直接用event追踪默认都是根节点下的“第一层（一级子节点）”
     event('request.lock_wait', duration_ms=(time.perf_counter()-lock_started)*1000)
     lease_acquired = sandbox_manager.acquire_lease(user_id)
     sandbox_token = bind_sandbox(user_id)

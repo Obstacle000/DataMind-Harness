@@ -9,6 +9,15 @@ import threading
 import time
 from contextvars import ContextVar
 from langchain_core.callbacks import BaseCallbackHandler
+# 为啥要搞一个current,直接搞一个全局变量trace不行吗?
+# 如果用普通全局变量，只要有两个用户同时发请求，链路追踪瞬间就串线乱套了
+# 如果用普通全局变量 current_trace = None：
+# 00:01：张三的请求进来，设置全局变量 current_trace = Trace(张三)；
+# 00:02：张三调用大模型，遇到 await 挂起让出 CPU；
+# 00:03：李四的请求进来，把同一个全局变量改写成了 current_trace = Trace(李四)；
+# 00:04：张三的协程醒来，调了一句 event('grader.start') 去读 current_trace——结果读成了李四的 Trace！ 张三的 Token 消耗和报错全被挂到李四的链路树下面去了。
+# ContextVar是给每一个并发请求（异步协程 Task）分配的专属储物柜
+# _current里的trace对象本身已经进行了用户隔离,每一次请求协程都创建一个独立的trace进行链路追踪
 _current = ContextVar('datamind_trace', default=None)
 _client = None
 _client_lock = threading.Lock()
@@ -121,6 +130,8 @@ class Trace:
         except Exception: return None
     # 记录一个瞬间事件（即刻打点）
     def event(self, name, **numbers):
+        # 用event追踪的,默认都是根节点下的“第一层（一级子节点）”
+        # 这里不传根节点的id,说明默认父节点就是根节点
         span = self.start(name)
         if span:
             try:
