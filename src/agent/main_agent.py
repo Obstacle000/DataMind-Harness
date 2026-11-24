@@ -315,6 +315,12 @@ def create_main_agent(
     )
 
     mcp_tools = load_mcp_tools_sync()
+    # execute_readonly_sql → 查 PostgreSQL（取实时源数据）；
+    # query_duckdb_olap → 跑 DuckDB（做复杂 OLAP 统计聚合和本地文件分析）。
+    # 一般不在启动的时候同步postgre数据到duckdb,本项目采用的方案是DuckDB 原生 postgres 扩展（ATTACH 联邦挂载）
+    # LOAD postgres;
+    # ATTACH 'postgresql://...' AS pg (TYPE POSTGRES, READ_ONLY);
+    # DuckDB 挂载后，查询时会自动把 WHERE 过滤和列裁剪下推给 PG，只拉需要的那一小块数据进 DuckDB 做高速向量化聚合。
     custom_tools = [
         # DataMind-Harness 核心数仓、OLAP、生成式图表与异步队列工具
         inspect_schema_map,

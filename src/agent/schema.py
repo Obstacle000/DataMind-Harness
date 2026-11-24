@@ -40,6 +40,10 @@ ProcurementContext = DataMindContext
 class ChatRequest(BaseModel):
     """聊天请求模型"""
     message: str = Field(..., description="用户消息内容")
+    images: list[str] = Field(
+        default_factory=list,
+        description="可选图片列表（支持 http(s) URL、data:image/...;base64,... 或纯 Base64 字符串）",
+    )
     thread_id: Optional[str] = Field(default=None, description="会话线程ID，为空则创建新会话")
     user_id: str = Field(default="default_user", description="用户ID")
     username: str = Field(default="数据分析师", description="用户名")

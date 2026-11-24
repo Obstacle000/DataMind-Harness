@@ -61,6 +61,31 @@ PHASE_LABELS = {
 from ...agent.observability import traced_stream, traced_config, event, start_span
 
 
+def _normalize_image_urls(images: list[str] | None) -> list[str]:
+    """将图片列表标准化为可被多模态 LLM 识别的 URL / Data-URI 列表。"""
+    urls: list[str] = []
+    for raw in images or []:
+        item = str(raw or "").strip()
+        if not item:
+            continue
+        if item.startswith(("http://", "https://", "data:image/")):
+            urls.append(item)
+        else:
+            # 裸 Base64 默认按 PNG 封装为标准 Data URI
+            urls.append(f"data:image/png;base64,{item}")
+    return urls
+
+
+def _build_user_content(message: str, image_urls: list[str]):
+    """无图片时保持纯字符串（100% 兼容纯文本模型）；有图片时构造标准多模态内容块列表。"""
+    if not image_urls:
+        return message
+    blocks: list[dict] = [{"type": "text", "text": message}]
+    for url in image_urls:
+        blocks.append({"type": "image_url", "image_url": {"url": url}})
+    return blocks
+
+
 @traced_stream
 async def stream_chat_response(
     message: str,
@@ -68,6 +93,7 @@ async def stream_chat_response(
     user_id: str = "default_user",
     username: str = "用户",
     resume_data: dict = None,
+    images: list[str] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     核心流式响应生成器
@@ -94,13 +120,18 @@ async def stream_chat_response(
         current_input = Command(resume=resume_data)
     else:
         display_messages = await agent_loader.get_display_messages(thread_id)
-        display_messages.append({
+        image_urls = _normalize_image_urls(images)
+        user_msg_record = {
             "id": str(uuid.uuid4()),
             "role": "user",
             "content": message,
             "timestamp": datetime.now().isoformat(),
-        })
-        current_input = {"messages": [{"role": "user", "content": message}]}
+        }
+        if image_urls:
+            user_msg_record["images"] = image_urls
+        display_messages.append(user_msg_record)
+        user_content = _build_user_content(message, image_urls)
+        current_input = {"messages": [{"role": "user", "content": user_content}]}
 
     # 把每次收到的文本 token 拼接成完整回复。
     assistant_content = ""
@@ -487,6 +518,7 @@ async def chat_stream(request: ChatRequest):
             thread_id=thread_id,
             user_id=request.user_id,
             username=request.username,
+            images=request.images,
         ),
         media_type="text/event-stream",
         headers={

@@ -7,20 +7,22 @@ from langchain_deepseek import ChatDeepSeek
 from .env_utils import get_env, get_env_int
 
 # ============ LLM 配置 ============
+# LLM_PROVIDER: "deepseek"（默认纯文本思考模型）或 "openai"（任意 OpenAI 兼容多模态模型，如 gpt-4o / qwen-vl-max / gemini-2.5-pro）
+LLM_PROVIDER = get_env("LLM_PROVIDER", "deepseek").lower()
 LLM_MODEL = get_env("LLM_MODEL", "deepseek-chat")
 LLM_BASE_URL = get_env("LLM_BASE_URL", "https://api.deepseek.com")
-LLM_API_KEY = get_env("DEEPSEEK_API_KEY", "")
+LLM_API_KEY = get_env("LLM_API_KEY", get_env("DEEPSEEK_API_KEY", ""))
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS = 4096
 LLM_REASONING_EFFORT = get_env("LLM_REASONING_EFFORT", "high")
 
 
 def get_llm(*, thinking: bool = True, timeout: float | None = None,
-            max_retries: int = 2, max_tokens: int = LLM_MAX_TOKENS) -> ChatDeepSeek:
-    """获取 DeepSeek 模型实例。
+            max_retries: int = 2, max_tokens: int = LLM_MAX_TOKENS):
+    """获取主/辅助 LLM 实例。
 
-    主 Agent 使用思考模式（复杂指标拆解与归因规划）；
-    需要强制结构化输出的内部评审器（Grader）与轻量路由器使用非思考模式。
+    - LLM_PROVIDER=deepseek（默认）：使用 ChatDeepSeek，主 Agent 启用思考模式，Grader/Router 关闭思考模式。
+    - LLM_PROVIDER=openai：使用 ChatOpenAI，支持多模态图片识别（gpt-4o / qwen-vl-max / gemini 等 OpenAI 兼容接口）。
     """
     common_kwargs = {
         "model": LLM_MODEL,
@@ -31,6 +33,14 @@ def get_llm(*, thinking: bool = True, timeout: float | None = None,
     }
     if timeout is not None:
         common_kwargs["timeout"] = timeout
+
+    if LLM_PROVIDER in ("openai", "openai_compatible", "multimodal"):
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            **common_kwargs,
+            temperature=LLM_TEMPERATURE,
+        )
+
     if thinking:
         return ChatDeepSeek(
             **common_kwargs,

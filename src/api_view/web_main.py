@@ -19,6 +19,7 @@ from .api.history import router as history_router
 from .web_config import close_mongo_client
 from ..agent.log_utils import web_logger
 from ..agent.backends.sandbox_manager import sandbox_manager
+from ..agent.clients.duckdb_client import duckdb_client
 from ..agent.clients.schema_map import schema_map_engine
 from ..agent.config import SANDBOX_MAINTENANCE_INTERVAL_SECONDS
 
@@ -57,6 +58,13 @@ async def lifespan(app: FastAPI):
             )
         except Exception as exc:
             web_logger.warning(f"Schema-Map startup warmup skipped due to error: {exc}")
+
+        # DuckDB 零拷贝只读挂载 PostgreSQL（若 PG 在线则直查真实数仓；离线则自动回退内置 8 张演示表）
+        try:
+            pg_attached = await asyncio.to_thread(duckdb_client.attach_postgres)
+            web_logger.info(f"DuckDB OLAP ready (pg_attached={pg_attached})")
+        except Exception as exc:
+            web_logger.warning(f"DuckDB PostgreSQL attach skipped: {exc}")
 
         await asyncio.to_thread(sandbox_manager.ensure_warm_pool)
         maintenance_task = asyncio.create_task(

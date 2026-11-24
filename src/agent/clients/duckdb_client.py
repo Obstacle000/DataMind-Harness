@@ -13,7 +13,7 @@ import sqlite3
 import threading
 from typing import Any, Dict, List
 
-from ..config import DUCKDB_DATABASE_PATH
+from ..config import DUCKDB_DATABASE_PATH, DUCKDB_MEMORY_LIMIT, POSTGRES_URI
 from ..log_utils import agent_logger
 
 
@@ -180,6 +180,7 @@ class DuckDBClient:
         self.database_path = database_path
         self._lock = threading.RLock()
         self._engine_name = "duckdb"
+        self._pg_attached = False
         self._conn = None
         self._init_engine()
 
@@ -188,6 +189,11 @@ class DuckDBClient:
             import duckdb
             self._conn = duckdb.connect(self.database_path)
             self._engine_name = "duckdb"
+            try:
+                safe_mem = str(DUCKDB_MEMORY_LIMIT).replace("'", "")
+                self._conn.execute(f"SET memory_limit='{safe_mem}';")
+            except Exception:
+                pass
             agent_logger.info(f"DuckDB OLAP engine initialized ({self.database_path})")
         except ImportError:
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
@@ -203,6 +209,36 @@ class DuckDBClient:
             if self._engine_name != "duckdb":
                 self._conn.commit()
 
+    def attach_postgres(self, postgres_uri: str = POSTGRES_URI) -> bool:
+        """通过 DuckDB 原生 postgres 扩展零拷贝只读挂载 PostgreSQL（谓词/列裁剪下推）。
+
+        - 挂载成功：执行 `USE pg;`，后续 OLAP 查询无需改写表名即可直查真实 PG 数仓数据；
+        - 挂载失败（PG 未启动 / 离线 / SQLite 兼容模式）：安全降级保留内置 8 张演示表。
+        """
+        if self._engine_name != "duckdb" or not postgres_uri:
+            return False
+
+        with self._lock:
+            if self._pg_attached:
+                return True
+            try:
+                escaped_uri = postgres_uri.replace("'", "''")
+                self._conn.execute("INSTALL postgres;")
+                self._conn.execute("LOAD postgres;")
+                self._conn.execute(
+                    f"ATTACH '{escaped_uri}' AS pg (TYPE POSTGRES, READ_ONLY);"
+                )
+                self._conn.execute("USE pg;")
+                self._pg_attached = True
+                agent_logger.info("DuckDB zero-copy attached to PostgreSQL (READ_ONLY)")
+                return True
+            except Exception as exc:
+                self._pg_attached = False
+                agent_logger.warning(
+                    f"DuckDB PostgreSQL ATTACH skipped (using built-in demo dataset): {exc}"
+                )
+                return False
+
     def query_olap(self, sql: str, limit: int = 500) -> Dict[str, Any]:
         """执行向量化 OLAP 查询并返回列名与字典行列表"""
         with self._lock:
@@ -213,6 +249,7 @@ class DuckDBClient:
                 rows = [dict(zip(columns, r)) for r in raw_rows]
                 return {
                     "engine": self._engine_name,
+                    "pg_attached": self._pg_attached,
                     "columns": columns,
                     "row_count": len(rows),
                     "rows": rows,
@@ -220,6 +257,7 @@ class DuckDBClient:
             except Exception as exc:
                 return {
                     "engine": self._engine_name,
+                    "pg_attached": self._pg_attached,
                     "error": str(exc),
                     "rows": [],
                 }
