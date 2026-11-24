@@ -1,0 +1,132 @@
+# ============================================================
+# DataMind-Harness 自演进数仓语义层血缘契约 (Self-Evolving Semantic Lineage)
+# 1. 严格按规范化四元组 (left_table, left_col, right_table, right_col) 唯一去重
+# 2. 汇集三层探边漏斗成果: physical_fk / sql_ast_mined / inclusion_llm_verified
+# ============================================================
+
+relationships:
+- left_table: dim_customers
+  left_col: customer_id
+  right_table: fact_orders
+  right_col: customer_id
+  source: semantic_layer
+  verified_count: 7
+  inclusion_ratio: 1.0
+  last_verified_at: '2026-11-22T15:33:19'
+- left_table: dim_products
+  left_col: product_id
+  right_table: fact_inventory_snapshots
+  right_col: product_id
+  source: physical_fk
+  verified_count: 3
+  inclusion_ratio: 1.0
+  last_verified_at: '2026-11-22T15:33:19'
+- left_table: dim_products
+  left_col: product_id
+  right_table: fact_order_items
+  right_col: product_id
+  source: physical_fk
+  verified_count: 3
+  inclusion_ratio: 1.0
+  last_verified_at: '2026-11-22T15:33:19'
+- left_table: dim_products
+  left_col: product_id
+  right_table: fact_returns
+  right_col: product_id
+  source: physical_fk
+  verified_count: 3
+  inclusion_ratio: 1.0
+  last_verified_at: '2026-11-22T15:33:19'
+- left_table: dim_products
+  left_col: supplier_id
+  right_table: dim_suppliers
+  right_col: supplier_id
+  source: semantic_layer
+  verified_count: 4
+  inclusion_ratio: 1.0
+  last_verified_at: '2026-11-22T15:00:00'
+- left_table: dim_suppliers
+  left_col: supplier_id
+  right_table: fact_quality_claims
+  right_col: vendor_code
+  source: inclusion_llm_verified
+  verified_count: 2
+  inclusion_ratio: 1.0
+  last_verified_at: '2026-11-22T15:33:19'
+- left_table: fact_order_items
+  left_col: order_id
+  right_table: fact_orders
+  right_col: order_id
+  source: physical_fk
+  verified_count: 3
+  inclusion_ratio: 1.0
+  last_verified_at: '2026-11-22T15:33:19'
+- left_table: fact_order_items
+  left_col: order_id
+  right_table: fact_returns
+  right_col: order_id
+  source: sql_ast_mined
+  verified_count: 1
+  inclusion_ratio: 1.0
+  last_verified_at: '2026-11-22T15:33:19'
+- left_table: fact_order_items
+  left_col: product_id
+  right_table: fact_returns
+  right_col: product_id
+  source: sql_ast_mined
+  verified_count: 1
+  inclusion_ratio: 1.0
+  last_verified_at: '2026-11-22T15:33:19'
+- left_table: fact_orders
+  left_col: order_id
+  right_table: fact_quality_claims
+  right_col: ord_ref_no
+  source: inclusion_llm_verified
+  verified_count: 2
+  inclusion_ratio: 1.0
+  last_verified_at: '2026-11-22T16:03:34'
+- left_table: fact_orders
+  left_col: order_id
+  right_table: fact_returns
+  right_col: order_id
+  source: physical_fk
+  verified_count: 3
+  inclusion_ratio: 1.0
+  last_verified_at: '2026-11-22T15:33:19'
+golden_sql_seed:
+- 'SELECT c.region, SUM(o.gross_amount) AS total_sales, SUM(r.refund_amount) AS total_refund
+
+  FROM fact_orders o
+
+  JOIN dim_customers c ON o.customer_id = c.customer_id
+
+  LEFT JOIN fact_returns r ON o.order_id = r.order_id
+
+  GROUP BY c.region
+
+  '
+- 'SELECT s.supplier_name, p.product_name, SUM(oi.line_profit) AS profit, SUM(r.refund_amount)
+  AS refund
+
+  FROM fact_order_items oi
+
+  JOIN fact_orders o ON oi.order_id = o.order_id
+
+  JOIN dim_products p ON oi.product_id = p.product_id
+
+  JOIN dim_suppliers s ON p.supplier_id = s.supplier_id
+
+  LEFT JOIN fact_returns r ON oi.order_id = r.order_id AND oi.product_id = r.product_id
+
+  GROUP BY s.supplier_name, p.product_name
+
+  '
+- 'SELECT p.category, inv.warehouse_region, SUM(inv.on_hand_qty) AS stock_qty
+
+  FROM fact_inventory_snapshots inv
+
+  JOIN dim_products p ON inv.product_id = p.product_id
+
+  GROUP BY p.category, inv.warehouse_region
+
+  '

@@ -280,7 +280,7 @@ class SchemaMapEngine:
             and self._relationships
         ):
             return  # 表结构 MD5 指纹未变，0 毫秒直接放行！
-        # 指纹变了,意味着表结构发生了变化,只有_schema是最新的
+        # 指纹变了,意味着表结构发生了变化,只有_schema是最新的,关系字典和schema_lineage都需要修改
         self._bootstrapped_schema_hash = current_hash
 
         raw_data: Dict[str, Any] = {}
@@ -704,7 +704,7 @@ class SchemaMapEngine:
         #     ("fact_order_items", "fact_returns"): 4.39,  # 2 个复合字段累加出来的边（权重最高！）
         # }
         edge_weights: Dict[Tuple[str, str], float] = {}
-        # 这个项目是不同Graph
+        # 这个项目是普通Graph
         # 之前Aider之所以用MultiGraph 是因为那里每一个文件是一个节点,但是真正连线的是内部的函数和类
         for (lt, lc, rt, rc), rel in self._relationships.items():
             if lt not in schema or rt not in schema or lt == rt:
