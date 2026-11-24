@@ -304,6 +304,7 @@ def get_delegation_context_prompt(configs: list[dict]) -> str:
     Returns:
         格式化的上下文协议提示词字符串
     """
+    # 给主agent看
     sections = []  # 存储每个子Agent的协议说明
     
     # 遍历每个子Agent配置

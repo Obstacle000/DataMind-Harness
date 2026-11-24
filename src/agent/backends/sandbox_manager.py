@@ -480,6 +480,7 @@ class SandboxManager:
 
     def rebuild(self, user_id: str = "default_user") -> CustomOpenSandbox:
         """重建用户沙箱（故障恢复）"""
+        # 当前的请求数
         active_runs = 0
         with self._lock:
             container_name = self._user_map.get(user_id)
@@ -489,6 +490,10 @@ class SandboxManager:
                 self._remove_entry(entry)
 
         sandbox = self._create_for_user(user_id)
+        # 用户的请求刚开始跑时，chat.py 调了 acquire_lease(user_id)，把旧容器的 old_entry.active_runs 加到了 1；
+        # 结果请求跑到一半，旧容器挂了,SandboxHealthMiddleware 触发 recreate_sandbox() 换了一个全新的替代容器 replacement；
+        # 新容器刚建出来，replacement.active_runs 默认是 0——但此时那个用户请求明明还在运行中
+        # 所以这 5 行代码把旧容器上记录的 active_runs（正在运行的请求数）原封不动继承移交到新容器 replacement 上，保证新容器在当前请求结束前不会被后台误杀，并且等请求 finally 调 release_lease() 减 1 时计数刚好严丝合缝。
         if active_runs:
             with self._lock:
                 replacement = self._entries.get(self._user_map.get(user_id, ""))

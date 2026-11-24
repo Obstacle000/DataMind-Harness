@@ -77,6 +77,7 @@ class SandboxCircuitBreakerMiddleware(AgentMiddleware):
         # 到了就把状态改成"HALF_OPEN",试探性调用handler(request),调用工具,如果成功调用_on_success,关闭熔断
         # 失败调用_on_failure,返回ToolMessage,模型判断继续等还是直接输出
         # 按理来说同一个模型不能熬过60秒的等待时间,在这之前模型已经输出了,所以60秒是在防新来的模型
+        # 就算头铁一直调用,也有调用工具限制
         tool_name = request.tool_call.get("name", "")
 
         # 非沙箱工具直接通过

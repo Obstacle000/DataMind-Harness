@@ -83,9 +83,10 @@ def pseudonym(value):
 
 # 链路追踪器 - 底层接入的是大模型领域最主流的开源 APM 平台：Langfuse(开源版langsmith)。
 # 流程:
-# @traced_stream 修饰stream_chat_response 初始化Trace,调用start_observation开启根节点root
+# @traced_stream 修饰stream_chat_response 初始化Trace,调用start_observation开启根节点root,初始化回调器
 #   traced_config把回调器放进运行时配置里
 #   @measured/event() - 瞬时打点,调用start()不传parent_id,开辟根节点写第一层节点,span开启后更新,立马关闭soan,传入name,和自定义字段
+#   期间遇到sse流,就根据需要瞬时打点
 #   内部官方源码自动调用on_方法,回调我自己写的on_方法,遇到on_start(),调用start(),传parent_id,开辟非第一层子节点,遇到on_end(),调用span.end()
 # 调用finish()关闭root根节点,reset恢复trace
 class Trace:
@@ -149,7 +150,7 @@ def event(name, **numbers):
     # 属性值只能传数值（int、float）或布尔值（bool）
     if trace: trace.event(name, **numbers)
 
-
+# 计时打点
 class SpanTimer:
     """可跨异步迭代手动闭合、也可直接 with / async with 的计时 Span。"""
     # 用的时候先start_span返回SpanTimer,然后with或者async with

@@ -455,6 +455,7 @@ class HarnessPhaseMiddleware(AgentMiddleware):
             updates["phase"] = Phase.executing.value
 
         # 同步 todos → plan（让 plan 字段真正生效）
+        # 不会判断todos有没有修改
         todos = state.get("todos")
         if todos:
             plan = _build_plan_from_todos(todos)

@@ -305,21 +305,26 @@ async def stream_chat_response(
                 continue
 
             # ===== Messages 流处理 =====
+            # 在 LangGraph 的 stream_mode="messages" 下，图里所有大模型吐出的字都会混在一起流出来，每个 chunk 是一个二元组 (message_chunk, metadata_dict)
             if chunk_type == "messages":
-                # Routing output is internal control data, never assistant text
-                # or a user-visible tool invocation.
+                # 防止后台“审查路由器小模型”的内部 JSON 泄露到用户聊天框里
+                # 开局时 ReviewPolicy 调路由器小模型判断是否需要质检时，小模型会吐出一段内部 JSON（{"decision": "review", "task_type": "sql_extraction", ...}），
+                # 并且调用时专门给它贴了个标签 tags=["review_router"]；看ReviewPolicy的start
+                # 这里先拿出 metadata = chunk[1]，一旦发现 tags 里有 "review_router"，直接 continue 吞掉
+                # 不需要对grader模型处理,因为底层不会把流传出去
                 metadata = chunk[1] if isinstance(chunk, (tuple, list)) and len(chunk) > 1 else {}
                 if isinstance(metadata, dict) and "review_router" in (metadata.get("tags") or []):
                     continue
                 # chunk 格式: (message_chunk, metadata_dict)
                 if isinstance(chunk, (list, tuple)) and len(chunk) >= 1:
+                    # 把二元组里的 chunk[0]（真正的 AIMessageChunk 或 ToolMessage）取出来赋给 token
                     token = chunk[0]
                 else:
                     token = chunk
 
                 if token is None:
                     continue
-
+                # token 类型:ai,tool,system,human
                 token_type = getattr(token, "type", "")
                 content = getattr(token, "content", "")
                 tool_call_chunks = getattr(token, "tool_call_chunks", None)

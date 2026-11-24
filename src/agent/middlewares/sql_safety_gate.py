@@ -75,6 +75,8 @@ class SqlSafetyGateMiddleware(AgentMiddleware):
         return None
 
     def _check_request(self, request: ToolCallRequest) -> ToolMessage | None:
+        # 主要是现在只读查询工具,只是起个名字,他的形参本身是一个sql语句,模型完全可以偷偷调用写入操作
+        # 这里是在调用这两个工具之前,看一下模型的toolcall参数是不是不老实
         tool_name = request.tool_call.get("name", "")
         if tool_name not in self.READONLY_SQL_TOOLS:
             return None

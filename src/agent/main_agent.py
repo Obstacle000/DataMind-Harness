@@ -253,15 +253,43 @@ def create_main_agent(
         set_sandbox(None, user_context.user_id)
 
     # deepagents >= 0.7 要求传入已初始化的 Backend 实例，
-    # 不再接受旧版的 backend factory。
+    # /memories/ 和 /persisted-skills/ 这两个路径根本不在 Docker 容器里，它们是给大模型看的“假路径（虚拟路径）”
+    # 情况 1（真进 Docker 容器硬盘）： 大模型调 write_file("/workspace/run.py", "print(1)") → 分拣员一看：不是那两个特殊前缀 → 交给 default（Docker 沙箱）→ 真正在 Docker 容器硬盘里生成了 /workspace/run.py，你进容器 ls /workspace 能看到它。
+    # 情况 2（压根不进 Docker 容器，直接截胡存进 MongoDB）： 大模型调 write_file("/memories/pref.md", "老板只看毛利率") → 分拣员一看：是 /memories/ 开头→ 不碰 Docker 容器，直接拦截交给 StoreBackend，变成一条 MongoDB 记录存进数据库里了
+    # /memories/ 主要是为了兼容 DeepAgents 框架的默认习惯：
+    # DeepAgents 内置的提示词和文件系统工具默认把 /memories/ 当作长期笔记目录。如果不把它路由到 MongoDB，万一大模型顺手调 write_file("/memories/notes.md") 记了东西，就会落进临时 Docker 容器里、容器一销毁就丢了；挂上 StoreBackend 相当于兜个底。
+    # /persisted-skills/ 则是真的省事（复用整套文件工具）：
+    # 一个自定义 Skill 不是一句话，而是一个包含 SKILL.md、Python 脚本、参考文档的多文件目录，而且模型经常要 ls 看目录、read_file 读代码、edit_file 局部改几行。
+    # 这两个路径不是模型的自作主张,而是为了契合提示词里明确告诉大模型的：“要持久化保存技能就写到 /persisted-skills/，记笔记就写到 /memories/”。
     backend_routes = {}
     if store is not None:
+        # StoreBackend 本身根本不需要知道底层是 MongoDB——它只认 LangGraph 编译图时挂进去的 store（只要符合 BaseStore 接口就行）
         backend_routes["/memories/"] = StoreBackend(
+            # 往 MongoDB 存数据时，要存进哪个用户专属分区（命名空间）
+            # 所以继承basestore要重写put那些,是为了截胡
             namespace=lambda _rt: (user_context.user_id,),
+            # {
+            #   "_id": "zhangsan::/note.md",
+            #   "namespace": ["zhangsan"],
+            #   "key": "/note.md",
+            #   "value": {
+            #     "content": ["老板每月 5 号看华东区毛利"],
+            #     "created_at": "2026-11-23T20:08:00+00:00",
+            #     "modified_at": "2026-11-23T20:08:00+00:00"
+            #   },
+            #   "created_at": "2026-11-23T20:08:00.123456",
+            #   "updated_at": "2026-11-23T20:08:00.123456"
+            # }
         )
         backend_routes["/persisted-skills/"] = StoreBackend(
             namespace=lambda _rt: skills_store_namespace(user_context.user_id),
         )
+    # def _route(self, path):
+    #     for prefix, backend in self.routes.items():
+    #         if path.startswith(prefix):
+    #             return backend       # 命中 "/memories/" 或 "/persisted-skills/" → 走 MongoDB！
+    #     return self.default          # 其他路径 → 走 Docker 沙箱！
+    # CompositeBackend 截胡的不只是 write_file，而是全套文件操作（write / read / edit / ls / grep）,所以模型感知不到store的存在,正常读写
     composite_backend = CompositeBackend(
         default=sandbox_backend,
         routes=backend_routes,
@@ -310,6 +338,8 @@ def create_main_agent(
     ]
 
     # 三层记忆：COLD 层按需检索 + 显式写入（WARM 层已在系统提示词里常驻注入）
+    # 上面其实并没有把 read_memory 和 remember 放进去
+    # 靠这个开关决定要不要让大模型读这两个工具
     if DEFAULT_MEMORY_CONFIG.memory_tools_enabled:
         from .tools.memory_tools import read_memory, remember
         custom_tools.extend([read_memory, remember])
@@ -335,6 +365,7 @@ def create_main_agent(
     subagents = resolve_subagent_tools(subagent_configs, all_tools)
     attach_to_subagents(subagents, skill_catalog, skill_read_tools)
     # 生成委派上下文协议（注入主 Agent 提示词）
+    # 这是给主agent的,让他委派的时候传好字段,outpu是在上面构建subagents字典的时候给子agent传的提示词
     delegation_prompt = get_delegation_context_prompt(subagent_configs)
 
     # ===== 5. 组装中间件栈 =====
@@ -438,6 +469,7 @@ def create_main_agent(
     middlewares = [
         # 在你使用的 LangChain / Deep Agents 框架中，列表的位置本身就是语义，顺序变化会直接改变中间件的执行逻辑、包裹层级以及最终效果。
         # --- 自定义中间件（执行顺序 1→7）---
+        # 现在沙箱如果掉了 只能等下一轮 健康检查的时候才能发现
         SandboxHealthMiddleware(
             sandbox_manager=sandbox_manager_instance,
             user_id=user_context.user_id,

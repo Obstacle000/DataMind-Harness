@@ -101,7 +101,11 @@ class SandboxHealthMiddleware(AgentMiddleware):
         if self._ping_sandbox():
             self._healthy = True
             self._consecutive_failures = 0
+            # 这里直接拿到方法
             touch = getattr(self._sandbox_manager, "touch", None)
+            # 最终调用的是SandboxEntry的touch() - self.last_active_at = datetime.now()
+            # getattr + callable是 Python 里非常经典的 “安全调用可选方法” 惯用写法
+            # 对比起obj.touch(user_id),防止obj不存在,防止obj.touch是普通属性
             if callable(touch):
                 touch(self._user_id)
             middleware_logger.debug(
