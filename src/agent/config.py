@@ -74,6 +74,18 @@ SCHEMA_MAP_CACHE_TTL_SECONDS = get_env_int("SCHEMA_MAP_CACHE_TTL_SECONDS", 1800)
 DUCKDB_DATABASE_PATH = get_env("DUCKDB_DATABASE_PATH", ":memory:")
 DUCKDB_MEMORY_LIMIT = get_env("DUCKDB_MEMORY_LIMIT", "256MB")
 
+# ============ Qdrant 向量数据库与 Embedding 配置 (Schema-Map 表名片与 Golden SQL 语义召回) ============
+# QDRANT_URL 为空时默认启用 Qdrant 本地内存模式 (:memory:)；未安装 qdrant-client 时自动降级内置余弦向量引擎
+QDRANT_URL = get_env("QDRANT_URL", "")
+QDRANT_API_KEY = get_env("QDRANT_API_KEY", "")
+QDRANT_LOCAL_PATH = get_env("QDRANT_LOCAL_PATH", ":memory:")
+QDRANT_TABLE_COLLECTION = get_env("QDRANT_TABLE_COLLECTION", "datamind_table_cards")
+QDRANT_SQL_COLLECTION = get_env("QDRANT_SQL_COLLECTION", "datamind_golden_sqls")
+EMBEDDING_MODEL = get_env("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_BASE_URL = get_env("EMBEDDING_BASE_URL", "")
+EMBEDDING_API_KEY = get_env("EMBEDDING_API_KEY", "")
+EMBEDDING_DIM = get_env_int("EMBEDDING_DIM", 256)
+
 # ============ MCP Server 配置 ============
 MCP_SERVER_URL = get_env("MCP_SERVER_URL", "http://localhost:9000")
 MCP_SSE_URL = f"{MCP_SERVER_URL}/sse"

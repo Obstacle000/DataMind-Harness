@@ -2,6 +2,7 @@
 # DataMind-Harness 自演进数仓语义层血缘契约 (Self-Evolving Semantic Lineage)
 # 1. 严格按规范化四元组 (left_table, left_col, right_table, right_col) 唯一去重
 # 2. 汇集三层探边漏斗成果: physical_fk / sql_ast_mined / inclusion_llm_verified
+# 3. 缓存离线 LLM 表画像 (table_profiles) 与历史黄金 SQL 问答对，用于灌入 Qdrant 向量库
 # ============================================================
 
 relationships:
@@ -93,40 +94,109 @@ relationships:
   verified_count: 3
   inclusion_ratio: 1.0
   last_verified_at: '2026-11-22T15:33:19'
+
+table_profiles:
+  dim_customers:
+    business_description: 客户主数据维度表，记录企业客户所属大区、城市、VIP等级与联系方式
+    synonyms: [客户, 买家, 采购方, 区域, 大区, 城市, VIP等级, 华东, 华南, 华北]
+    column_glossary:
+      customer_id: 客户唯一主键
+      customer_name: 企业客户名称
+      region: 所属销售大区
+      city: 所在城市
+      vip_tier: 客户价值分层等级
+  dim_suppliers:
+    business_description: 供应商主数据维度表，记录供应商信用评分、承诺交期天数与合作状态
+    synonyms: [供应商, 厂家, 供货商, 厂商, 信用分, 评级, 交期, 准时率]
+    column_glossary:
+      supplier_id: 供应商唯一主键
+      supplier_name: 供应商企业名称
+      credit_score: 供应商综合信用评分
+      lead_time_days: 承诺交货周期天数
+  dim_products:
+    business_description: 商品与工业零部件维度表，记录SKU编码、品类、绑定供应商、标准采购成本与安全库存水位
+    synonyms: [商品, 零件, 零部件, 物料, 产品, SKU, 品类, 成本, 采购价, 安全库存]
+    column_glossary:
+      product_id: 商品唯一主键
+      sku_code: 标准物料SKU编码
+      product_name: 商品或零件名称
+      category: 所属产品线品类
+      unit_cost: 标准单位采购成本
+      safety_stock: 安全库存预警阈值
+  fact_orders:
+    business_description: 销售与采购主订单事实表（核心枢纽表），记录下单日期、GMV毛交易总额、折扣优惠与物流运费
+    synonyms: [订单, 主订单, 销售单, 成交单, GMV, 营收, 销售额, 营业额, 下单, 运费, 物流费, 折扣]
+    column_glossary:
+      order_id: 订单唯一主键
+      order_no: 业务订单流水号
+      order_date: 下单日期
+      gross_amount: 订单毛交易总额(GMV)
+      discount_amount: 订单优惠折扣金额
+      shipping_fee: 物流运费金额
+  fact_order_items:
+    business_description: 订单明细行事实表，记录单品成交数量、成交单价与单行毛利额（核算赚了多少钱的核心表）
+    synonyms: [订单明细, 明细行, 毛利, 利润, 赚了多少钱, 盈利, 净利, 销量, 成交量, 单价]
+    column_glossary:
+      item_id: 明细行主键
+      quantity: 单品成交数量
+      unit_price: 实际成交单价
+      line_profit: 单行毛利额(核心盈利指标)
+  fact_returns:
+    business_description: 退货与售后退款事实表，记录退货日期、退款扣减金额与质量缺陷原因
+    synonyms: [退货, 退款, 售后, 返修, 退单, 质量缺陷, 瑕疵, 退货率, 退款额]
+    column_glossary:
+      return_id: 退货单主键
+      refund_amount: 实际退货退款金额
+      defect_reason: 质量问题或退货原因
+  fact_inventory_snapshots:
+    business_description: 仓库每日库存快照事实表，记录各仓库大区的在库现货量与在途库存量
+    synonyms: [库存, 现货, 在库量, 在途量, 缺货, 断货, 补货, 仓库快照]
+    column_glossary:
+      snapshot_id: 快照主键
+      warehouse_region: 仓库所在大区
+      on_hand_qty: 当前在库可用现货数量
+      in_transit_qty: 采购在途数量
+  fact_quality_claims:
+    business_description: 供应商质量索赔孤岛事实表，记录关联订单号(ord_ref_no)、责任供应商(vendor_code)与质量索赔扣款金额
+    synonyms: [索赔, 质量索赔, 违约金, 赔付, 罚款, 扣款, 供应商追责, 质量事故]
+    column_glossary:
+      claim_id: 索赔单主键
+      ord_ref_no: 关联业务订单号(异名外键 -> fact_orders.order_id)
+      vendor_code: 责任供应商编码(异名外键 -> dim_suppliers.supplier_id)
+      claim_amount: 质量索赔扣款金额
+
 golden_sql_seed:
-- 'SELECT c.region, SUM(o.gross_amount) AS total_sales, SUM(r.refund_amount) AS total_refund
-
-  FROM fact_orders o
-
-  JOIN dim_customers c ON o.customer_id = c.customer_id
-
-  LEFT JOIN fact_returns r ON o.order_id = r.order_id
-
-  GROUP BY c.region
-
-  '
-- 'SELECT s.supplier_name, p.product_name, SUM(oi.line_profit) AS profit, SUM(r.refund_amount)
-  AS refund
-
-  FROM fact_order_items oi
-
-  JOIN fact_orders o ON oi.order_id = o.order_id
-
-  JOIN dim_products p ON oi.product_id = p.product_id
-
-  JOIN dim_suppliers s ON p.supplier_id = s.supplier_id
-
-  LEFT JOIN fact_returns r ON oi.order_id = r.order_id AND oi.product_id = r.product_id
-
-  GROUP BY s.supplier_name, p.product_name
-
-  '
-- 'SELECT p.category, inv.warehouse_region, SUM(inv.on_hand_qty) AS stock_qty
-
-  FROM fact_inventory_snapshots inv
-
-  JOIN dim_products p ON inv.product_id = p.product_id
-
-  GROUP BY p.category, inv.warehouse_region
-
-  '
+- question: 统计各区域客户的订单销售总额(GMV)与退货退款金额
+  tables: [dim_customers, fact_orders, fact_returns]
+  sql: |
+    SELECT c.region, SUM(o.gross_amount) AS total_sales, SUM(r.refund_amount) AS total_refund
+    FROM fact_orders o
+    JOIN dim_customers c ON o.customer_id = c.customer_id
+    LEFT JOIN fact_returns r ON o.order_id = r.order_id
+    GROUP BY c.region
+- question: 分析各供应商及商品赚了多少钱（毛利利润）与退货退款金额对比
+  tables: [dim_products, dim_suppliers, fact_order_items, fact_orders, fact_returns]
+  sql: |
+    SELECT s.supplier_name, p.product_name, SUM(oi.line_profit) AS profit, SUM(r.refund_amount) AS refund
+    FROM fact_order_items oi
+    JOIN fact_orders o ON oi.order_id = o.order_id
+    JOIN dim_products p ON oi.product_id = p.product_id
+    JOIN dim_suppliers s ON p.supplier_id = s.supplier_id
+    LEFT JOIN fact_returns r ON oi.order_id = r.order_id AND oi.product_id = r.product_id
+    GROUP BY s.supplier_name, p.product_name
+- question: 查询各商品品类在不同仓库大区的现货库存与在途库存量
+  tables: [dim_products, fact_inventory_snapshots]
+  sql: |
+    SELECT p.category, inv.warehouse_region, SUM(inv.on_hand_qty) AS stock_qty
+    FROM fact_inventory_snapshots inv
+    JOIN dim_products p ON inv.product_id = p.product_id
+    GROUP BY p.category, inv.warehouse_region
+- question: 查询客户订单关联的供应商质量索赔扣款金额
+  tables: [dim_customers, dim_suppliers, fact_orders, fact_quality_claims]
+  sql: |
+    SELECT c.customer_name, s.supplier_name, SUM(qc.claim_amount) AS total_claim
+    FROM fact_quality_claims qc
+    JOIN fact_orders o ON qc.ord_ref_no = o.order_id
+    JOIN dim_customers c ON o.customer_id = c.customer_id
+    JOIN dim_suppliers s ON qc.vendor_code = s.supplier_id
+    GROUP BY c.customer_name, s.supplier_name

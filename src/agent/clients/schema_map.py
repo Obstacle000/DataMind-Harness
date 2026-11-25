@@ -59,6 +59,24 @@ Schema-Map 数仓血缘图谱与 Table-Rank 引擎
 #   - 终极解法（像手机导航一样分「主路线」与「备选替换路线」两栏）：
 #     用并查集按权重选出 N-1 条无环边放进【1. 默认主干连法】，把剩下的环路边放进【2. 备选替换连法】，
 #     既保证了关键细粒度边 100% 不丢失，又通过显式分栏+防环警告阻止大模型把三角形的 3 条边同时写进一条 SQL！
+
+# 重要:这个大纲最终输出的关联不是看_relationships, _relationships决定graph里的节点边权重,,节点边权重产生生成树 决定backbone_edges和alternative_edges
+# _relationships（全库四元组真相源 + verified_count）
+#     ↓ _build_adjacency()
+# adj（邻接表） + joined_conds（复合 ON 条件） + edge_weights（边权重）
+#     ↓ compute_table_rank()
+# 加权 PageRank 排序 → 选出 Top-K 核心表
+#     ↓ resolve_connected_subgraph()
+# ① 多源 BFS 补桥（用 adj 打通孤岛）
+# ② Kruskal 最大生成树（按 edge_weights 排序 + 并查集防环）
+#     → 拆出 backbone_edges（默认无环主干） + alternative_edges（备选替换边）
+#     ↓ build_schema_map_prompt()
+# Aider 二分控预算 → 完整渲染表字段 + 主干/备选 JOIN 路径给大模型
+
+# 你可能觉得饶了好大一圈,一开始不是已经有关联了吗,并非,一开始拿到的是全部的关联数据,而我们需要根据用户query,得到最符合的前K个表,所以需要pagerank算法
+# 所以repomap是每一次提问重新生成,而relationships,能离线生成
+# 第一阶段:根据schema,同步_relationships和schema_lineage.yaml - lifespan
+# 第二阶段:根据relationships,调用_build_adjacency获得关系,compute_table_rank连线,然后获取前k个,resolve_connected_subgraph做bfs+创建生成树,最终获得关系 - 每次提问模型调用工具
 from __future__ import annotations
 
 from collections import deque
@@ -74,6 +92,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import yaml
 
 from .postgres_client import postgres_client
+from .qdrant_client import qdrant_retriever
 from .redis_client import redis_client
 from ..log_utils import agent_logger
 
@@ -112,6 +131,7 @@ class SchemaMapEngine:
         #     }
         self._schema: Dict[str, Dict[str, Any]] = {}
         # 严格按规范化四元组唯一去重: (left_table, left_col, right_table, right_col) -> dict
+        # 只存单向
         # ("dim_customers", "customer_id", "fact_orders", "customer_id"): {
         #         "left_table": "dim_customers",
         #         "left_col": "customer_id",
@@ -123,6 +143,10 @@ class SchemaMapEngine:
         #         "last_verified_at": "2026-11-22T15:33:19",
         #     }
         self._relationships: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        # 离线 LLM 表画像缓存: {table_name: {"business_description": str, "synonyms": list[str], "column_glossary": dict}}
+        self._table_profiles: Dict[str, Dict[str, Any]] = {}
+        # 历史 Golden SQL 问答记录: [{"question": str, "sql": str, "tables": list[str]}]
+        self._golden_sql_records: List[Dict[str, Any]] = []
         # 表结构 MD5 指纹（替代死板的 bool 开关）：表结构未变时 0ms 跳过第一阶段；表结构一旦改变，指纹不一致自动触发三步对账更新
         self._bootstrapped_schema_hash: str = ""
         self._yaml_loaded_once: bool = False
@@ -214,6 +238,7 @@ class SchemaMapEngine:
     # ============================================================
 
     def load_schema(self, force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+        # 执行完这个函数后关系字典和schema_lineage都是最新状态
         with self._lock:
             if not force_refresh:
                 # 1. 先看 Redis 缓存里有没有存好的表结构
@@ -339,7 +364,17 @@ class SchemaMapEngine:
                 )
                 dirty = dirty or added
 
-        seed_sqls = raw_data.get("golden_sql_seed", []) or []
+        raw_seeds = raw_data.get("golden_sql_seed", []) or []
+        seed_sqls, normalized_golden = self._normalize_golden_sql_seeds(
+            raw_seeds, set(self._schema.keys())
+        )
+        self._golden_sql_records = normalized_golden
+
+        # 加载已缓存的离线表画像 table_profiles
+        raw_profiles = raw_data.get("table_profiles", {})
+        if isinstance(raw_profiles, dict):
+            self._table_profiles.update(raw_profiles)
+
         if seed_sqls:
             mined_new = self.mine_join_edges_from_sql_history(
                 seed_sqls, persist=False, only_new=True
@@ -350,7 +385,12 @@ class SchemaMapEngine:
         discovered_new = self.discover_hidden_foreign_keys(persist=False)
         dirty = dirty or (discovered_new > 0)
 
-        # 只要发生了死边剔除或新边发现，立即原子覆写更新 schema_lineage.yaml！
+        # 对账第 4 步：【离线 LLM 自动补齐缺失表画像 + 同步灌入 Qdrant 向量数据库】
+        profile_added = self._ensure_table_profiles()
+        dirty = dirty or profile_added
+        self._sync_qdrant_vector_index()
+
+        # 只要发生了死边剔除、新边发现或新表画像补齐，立即原子覆写更新 schema_lineage.yaml！
         if dirty:
             self._persist_lineage_to_yaml()
 
@@ -511,20 +551,25 @@ class SchemaMapEngine:
         return False
 
     def _persist_lineage_to_yaml(self) -> None:
-        """将按四元组严格去重后的关系表原子写回 schema_lineage.yaml"""
+        """将按四元组严格去重后的关系表、离线 LLM 表画像与 Golden SQL 原子写回 schema_lineage.yaml"""
         with self._lock:
             try:
-                existing_seeds: List[str] = []
+                existing_seeds: List[Any] = list(self._golden_sql_records)
+                existing_profiles: Dict[str, Any] = dict(self._table_profiles)
                 if self.lineage_path.exists():
                     old = yaml.safe_load(self.lineage_path.read_text(encoding="utf-8")) or {}
-                    existing_seeds = old.get("golden_sql_seed", []) or []
+                    if not existing_seeds:
+                        existing_seeds = old.get("golden_sql_seed", []) or []
+                    if not existing_profiles and isinstance(old.get("table_profiles"), dict):
+                        existing_profiles = old.get("table_profiles", {})
 
                 sorted_rels = [
                     self._relationships[k]
                     for k in sorted(self._relationships.keys())
                 ]
-                payload = {
+                payload: Dict[str, Any] = {
                     "relationships": sorted_rels,
+                    "table_profiles": existing_profiles,
                     "golden_sql_seed": existing_seeds,
                 }
                 header = (
@@ -532,6 +577,7 @@ class SchemaMapEngine:
                     "# DataMind-Harness 自演进数仓语义层血缘契约 (Self-Evolving Semantic Lineage)\n"
                     "# 1. 严格按规范化四元组 (left_table, left_col, right_table, right_col) 唯一去重\n"
                     "# 2. 汇集三层探边漏斗成果: physical_fk / sql_ast_mined / inclusion_llm_verified\n"
+                    "# 3. 缓存离线 LLM 表画像 (table_profiles) 与历史黄金 SQL 问答对，用于灌入 Qdrant 向量库\n"
                     "# ============================================================\n\n"
                 )
                 yaml_body = yaml.safe_dump(
@@ -543,6 +589,148 @@ class SchemaMapEngine:
                 self.lineage_path.write_text(header + yaml_body, encoding="utf-8")
             except Exception as exc:
                 agent_logger.warning(f"Failed to persist self-evolving lineage YAML: {exc}")
+
+    # ============================================================
+    # 离线 LLM 表画像补齐 + Table Card 构建 + Qdrant 向量库同步
+    # ============================================================
+
+    @classmethod
+    def _extract_tables_from_sql(cls, sql: str, known_tables: Set[str]) -> List[str]:
+        """从单条 SQL 中提取涉及的所有真实数仓表名"""
+        found: Set[str] = set()
+        try:
+            import sqlglot
+            from sqlglot import exp
+
+            for parsed in sqlglot.parse(sql):
+                if parsed is None:
+                    continue
+                for tbl in parsed.find_all(exp.Table):
+                    if tbl.name in known_tables:
+                        found.add(tbl.name)
+        except Exception:
+            pass
+
+        if not found:
+            for t_name in known_tables:
+                if re.search(rf"\b{re.escape(t_name)}\b", sql, re.IGNORECASE):
+                    found.add(t_name)
+        return sorted(found)
+
+    @classmethod
+    def _normalize_golden_sql_seeds(
+        cls, raw_seeds: List[Any], known_tables: Set[str]
+    ) -> Tuple[List[str], List[Dict[str, Any]]]:
+        """兼容纯字符串 SQL 与结构化 {question, sql, tables} 黄金问答种子"""
+        sql_list: List[str] = []
+        records: List[Dict[str, Any]] = []
+        for item in raw_seeds:
+            if isinstance(item, str) and item.strip():
+                sql_str = item.strip()
+                tables = cls._extract_tables_from_sql(sql_str, known_tables)
+                sql_list.append(sql_str)
+                records.append({"question": "", "sql": sql_str, "tables": tables})
+            elif isinstance(item, dict):
+                sql_str = str(item.get("sql", "")).strip()
+                if not sql_str:
+                    continue
+                q_str = str(item.get("question", "")).strip()
+                raw_tables = item.get("tables")
+                if isinstance(raw_tables, list) and raw_tables:
+                    tables = sorted({str(t) for t in raw_tables if str(t) in known_tables})
+                else:
+                    tables = cls._extract_tables_from_sql(sql_str, known_tables)
+                sql_list.append(sql_str)
+                records.append({"question": q_str, "sql": sql_str, "tables": tables})
+        return sql_list, records
+
+    def _ensure_table_profiles(self) -> bool:
+        """离线第 1 步：对缺失画像的新表自动抽样并由 LLM（或元数据合成）补齐业务描述与同义词"""
+        changed = False
+        for table_name, meta in self._schema.items():
+            existing = self._table_profiles.get(table_name)
+            if isinstance(existing, dict) and existing.get("business_description"):
+                continue
+
+            desc = str(meta.get("description", "") or f"数仓表 {table_name}")
+            col_glossary = {
+                str(c["name"]): str(c.get("comment", "") or c["name"])
+                for c in meta.get("columns", [])
+            }
+            synonyms: List[str] = []
+            for dom_kws in _ENTITY_SEMANTIC_DOMAINS.values():
+                if any(k in table_name.lower() or k in desc.lower() for k in dom_kws):
+                    synonyms.extend(dom_kws)
+
+            # 若配置了 LLM API Key，则抽样 3 行样本数据请大模型自动补齐表画像与业务同义词
+            if os.getenv("DEEPSEEK_API_KEY", "").strip() or os.getenv("LLM_API_KEY", "").strip():
+                try:
+                    from pydantic import BaseModel, Field
+                    from ..config import get_llm
+
+                    class _LLMTableProfile(BaseModel):
+                        business_description: str = Field(description="一句话中文业务含义")
+                        synonyms: List[str] = Field(default_factory=list, description="5~10个业务同义词或常见口语问法")
+                        column_glossary: Dict[str, str] = Field(default_factory=dict, description="字段名到中文含义映射")
+
+                    sample_res = postgres_client.execute_readonly_query(
+                        f"SELECT * FROM {table_name} LIMIT 3"
+                    )
+                    sample_rows = sample_res.get("rows", [])[:3]
+                    llm = get_llm(thinking=False, timeout=8, max_tokens=512).with_structured_output(_LLMTableProfile)
+                    prof = llm.invoke(
+                        f"请为数仓表 `{table_name}` 生成业务语义画像。\n"
+                        f"现有表注释: {desc}\n"
+                        f"字段列表: {meta.get('columns', [])}\n"
+                        f"样本数据(前3行): {sample_rows}"
+                    )
+                    if prof and prof.business_description:
+                        desc = prof.business_description
+                        synonyms = list(dict.fromkeys([*synonyms, *(prof.synonyms or [])]))
+                        col_glossary.update(prof.column_glossary or {})
+                except Exception as exc:
+                    agent_logger.debug(f"Offline LLM table profiling fallback for {table_name}: {exc}")
+
+            self._table_profiles[table_name] = {
+                "business_description": desc,
+                "synonyms": list(dict.fromkeys(synonyms)),
+                "column_glossary": col_glossary,
+            }
+            changed = True
+        return changed
+
+    def _build_table_card_text(self, table_name: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+        """离线第 2 步：将单张表的表名 + 描述 + 离线画像同义词 + 字段注释拼成一张 Table Card"""
+        prof = self._table_profiles.get(table_name, {}) or {}
+        b_desc = prof.get("business_description") or meta.get("description", "")
+        synonyms = prof.get("synonyms", []) or []
+        glossary = prof.get("column_glossary", {}) or {}
+
+        col_parts: List[str] = []
+        for col in meta.get("columns", []):
+            c_name = str(col.get("name", ""))
+            c_comm = glossary.get(c_name) or str(col.get("comment", ""))
+            col_parts.append(f"{c_name}({c_comm})" if c_comm else c_name)
+
+        card_text = (
+            f"表名: {table_name}\n"
+            f"业务描述: {b_desc} {meta.get('description', '')}\n"
+            f"业务同义词: {', '.join(str(s) for s in synonyms)}\n"
+            f"核心字段: {', '.join(col_parts)}"
+        )
+        return {"card_text": card_text, "synonyms": synonyms}
+
+    def _sync_qdrant_vector_index(self) -> None:
+        """将所有表的 Table Cards 与历史 Golden SQL 同步写入 Qdrant 向量数据库"""
+        if not self._schema:
+            return
+        table_cards = {
+            t_name: self._build_table_card_text(t_name, meta)
+            for t_name, meta in self._schema.items()
+        }
+        qdrant_retriever.upsert_table_cards(table_cards)
+        if self._golden_sql_records:
+            qdrant_retriever.upsert_golden_sqls(self._golden_sql_records)
 
     # ============================================================
     # 第一阶段第 2 层 & 运行时自更新：SQLGlot AST 解析（四元组去重）
@@ -591,9 +779,24 @@ class SchemaMapEngine:
                 self._persist_lineage_to_yaml()
             return changed_count
 
-    def learn_from_executed_sql(self, sql: str) -> int:
+    def learn_from_executed_sql(self, sql: str, question: str = "") -> int:
         self.load_schema()
-        return self.mine_join_edges_from_sql_history([sql], persist=True, only_new=False)
+        changed = self.mine_join_edges_from_sql_history([sql], persist=False, only_new=False)
+        tables = self._extract_tables_from_sql(sql, set(self._schema.keys()))
+        if tables and sql.strip():
+            cleaned_sql = sql.strip()
+            existing_sqls = {r.get("sql", "").strip() for r in self._golden_sql_records}
+            if cleaned_sql not in existing_sqls:
+                self._golden_sql_records.append({
+                    "question": (question or "").strip(),
+                    "sql": cleaned_sql,
+                    "tables": tables,
+                })
+                qdrant_retriever.upsert_golden_sqls(self._golden_sql_records)
+                changed = max(changed, 1)
+        if changed > 0:
+            self._persist_lineage_to_yaml()
+        return changed
 
     @staticmethod
     def _extract_joins_from_single_sql(
@@ -713,8 +916,11 @@ class SchemaMapEngine:
             adj[rt].add(lt)
             cond = f"{lt}.{lc} = {rt}.{rc}"
             freq_boost = 1.0 + math.log1p(int(rel.get("verified_count", 1)))
+            # _relationships里的是单向,为什么这里必须要conds,因为去重的粒度不同
+            # 如果两张表之间有 2 个复合关联字段（比如 fact_order_items 和 fact_returns 同时靠 order_id 和 product_id 关联），
+            # _relationships 里是 2 条不同的记录，但它们的 pair 都是同一个 ("fact_order_items", "fact_returns")！
+            # 就是为了加频率权重以及复合关联才这么设计的
             # 双向存 Key、收集复合 JOIN 条件、累加边权重
-            # 把正向 (lt, rt) 和反向 (rt, lt) 同時に写进字典里
             for pair in ((lt, rt), (rt, lt)):
                 # conds是edge_join_conditions复制
                 conds = edge_join_conditions.setdefault(pair, [])
@@ -727,6 +933,7 @@ class SchemaMapEngine:
         #     ("dim_customers", "fact_orders"): "dim_customers.customer_id = fact_orders.customer_id",
         #     ("fact_orders", "dim_customers"): "dim_customers.customer_id = fact_orders.customer_id",
         # }会有重复的
+        # 最终pagerank 节点也是双向边
         return adj, joined_conds, edge_weights
 
     def compute_table_rank(
@@ -747,24 +954,63 @@ class SchemaMapEngine:
         lowered_q = (query or "").lower()
         seed_set = set(seed_tables or [])
 
+        # 纯硬编码加权还是太抽象了,得改
+        # 1. 离线 LLM 自动补齐“表画像”,让llm写业务描述和同义词
+        # 2. 向量相似度把每张表的“表名 + 字段 + 注释 + 同义词”拼成一张 Table Card 提前算好向量；
+        # 在线收到 query 时算余弦相似度 cosine_sim(query, table_card)，直接拿这个相似度分数当 PageRank 的 personalization[t]
+        # 3. 相似历史 Golden SQL 召回拿当前 query 去向量库搜历史上最像的 Top-3 黄金 SQL，看它们 FROM / JOIN 了哪几张表，直接给这几张表的 personalization 加超高权重
+        # 在线只编码 1 次 query 向量，同时复用于 Qdrant Table-Card 检索与 Golden-SQL Top-3 检索
+        q_vec = qdrant_retriever.embed_text(lowered_q) if lowered_q else None
+        table_card_sims: Dict[str, float] = (
+            qdrant_retriever.search_table_cards(lowered_q, query_vector=q_vec, top_k=len(tables))
+            if q_vec is not None
+            else {}
+        )
+        top_golden_sqls: List[Dict[str, Any]] = (
+            qdrant_retriever.search_golden_sqls(lowered_q, query_vector=q_vec, top_k=3)
+            if q_vec is not None
+            else []
+        )
+
+        # 路 3：统计 Top-3 相似历史 Golden SQL 命中的表加权分
+        sql_boost_map: Dict[str, float] = {t: 0.0 for t in tables}
+        for sql_hit in top_golden_sqls:
+            sim = float(sql_hit.get("score", 0.0))
+            if sim > 0.18:
+                for hit_tbl in sql_hit.get("tables", []) or []:
+                    if hit_tbl in sql_boost_map:
+                        sql_boost_map[hit_tbl] += sim * 9.0
+
         for t, meta in schema.items():
-            weight = 1.0
-            if t in seed_set or t.lower() in lowered_q:
+            weight = 1.0  # 基础底分（防 0 权重）
+
+            # 路 1：显式表名/字段名精确命中 + 离线 LLM 表画像同义词命中
+            if t in seed_set or (lowered_q and t.lower() in lowered_q):
                 weight += 8.0
-            desc = str(meta.get("description", "")).lower()
-            for token in ("客户", "供应商", "订单", "退货", "索赔", "库存", "商品", "零件", "毛利", "运费", "区域", "城市"):
-                if token in lowered_q and token in desc:
-                    weight += 4.0
+
+            prof = self._table_profiles.get(t, {}) or {}
+            synonyms = prof.get("synonyms", []) or []
+            for syn in synonyms:
+                syn_str = str(syn).strip().lower()
+                if syn_str and syn_str in lowered_q:
+                    weight += 3.5
+
             for col in meta.get("columns", []):
                 c_name = str(col.get("name", "")).lower()
-                c_comm = str(col.get("comment", "")).lower()
-                if (c_name and c_name in lowered_q) or any(
-                    k in lowered_q and k in c_comm for k in ("退货", "索赔", "毛利", "成本", "城市", "等级", "库存", "交期")
-                ):
-                    weight += 3.0
-            personalization[t] = weight
+                if c_name and len(c_name) > 2 and c_name in lowered_q:
+                    weight += 4.0
+
+            # 路 2：Qdrant Table-Card 余弦相似度（减基线后平方放大，拉开高相关表与边缘表差距）
+            card_sim = float(table_card_sims.get(t, 0.0))
+            vec_score = (max(0.0, card_sim - 0.10) ** 2) * 16.0
+
+            # 路 3：Qdrant Top-3 历史 Golden SQL 召回表加成
+            sql_boost = sql_boost_map.get(t, 0.0)
+
+            personalization[t] = weight + vec_score + sql_boost
 
         total_p = sum(personalization.values()) or 1.0
+        # 如果用networkx不需要手动归一化,这里是因为后面实现了没装networkx时的手写幂迭代兜底分支
         personalization = {k: v / total_p for k, v in personalization.items()}
 
         try:

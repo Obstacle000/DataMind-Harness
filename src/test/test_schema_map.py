@@ -42,3 +42,15 @@ class TestSchemaMapEngine:
         assert "fact_orders" in sub["final_tables"]
         assert "fact_orders" in sub["bridge_tables"]
         assert len(sub["backbone_edges"]) >= 2
+
+    def test_qdrant_table_card_and_golden_sql_semantic_recall(self):
+        """口语化查询（如'赚了多少钱'、'违约金罚款'）通过离线表画像 + Qdrant 向量检索精准召回目标表"""
+        ranked_profit = dict(schema_map_engine.compute_table_rank("上个月各商品赚了多少钱"))
+        ranked_claim = dict(schema_map_engine.compute_table_rank("供应商违约金罚款扣款"))
+
+        top3_profit = list(ranked_profit.keys())[:3]
+        top3_claim = list(ranked_claim.keys())[:3]
+
+        assert "fact_order_items" in top3_profit
+        assert "fact_quality_claims" in top3_claim
+
