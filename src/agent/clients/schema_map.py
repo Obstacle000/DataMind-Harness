@@ -391,6 +391,7 @@ class SchemaMapEngine:
         self._sync_qdrant_vector_index()
 
         # 只要发生了死边剔除、新边发现或新表画像补齐，立即原子覆写更新 schema_lineage.yaml！
+        # 把 relationships + table_profiles + golden_sql_seed 一起写回文件
         if dirty:
             self._persist_lineage_to_yaml()
 
@@ -780,6 +781,8 @@ class SchemaMapEngine:
             return changed_count
 
     def learn_from_executed_sql(self, sql: str, question: str = "") -> int:
+        # 每当大模型在线上调用 execute_readonly_sql(sql) 真正执行成功并查出非空数据时
+        # 会调用本方法提取出用到的表名 tables,更新qdrant
         self.load_schema()
         changed = self.mine_join_edges_from_sql_history([sql], persist=False, only_new=False)
         tables = self._extract_tables_from_sql(sql, set(self._schema.keys()))
@@ -943,6 +946,21 @@ class SchemaMapEngine:
         damping: float = 0.85,
         iterations: int = 30,
     ) -> List[Tuple[str, float]]:
+        # 加权规则:
+        # 基础底分：1.0 保证每张表都有非零起点，在图游走时能正常传导分数。
+        # 路 1：精确标识符 + 离线 LLM 表画像同义词命中（L977-L992）
+        # query 直接包含表名（或指定了 seed_tables） → + 8.0
+        # query 直接包含该表的字段英文名（长度 > 2） → 每个字段 + 4.0
+        # query 命中该表在 table_profiles 里的业务同义词（如 "GMV"、"赚了多少钱"、"违约金"） → 每个同义词 + 3.5
+        # 路 2：Qdrant Table-Card 余弦相似度 vec_score（L994-L996）
+        # 拿 query 的向量 q_vec 去 Qdrant 的 datamind_table_cards 集合算余弦相似度 card_sim；
+        # 减掉底噪 0.10 后平方放大：
+        # vec_score = (max(0.0, card_sim - 0.10) ** 2) * 16.0
+        # (平方的作用是让高相关表得分非线性飙升，而低相关边缘表得分贴近 0。)
+        # 路 3：Qdrant Top-3 历史 Golden SQL 召回加成 sql_boost（L966-L973）
+        # 复用同一个 q_vec 去 Qdrant 的 datamind_golden_sqls 集合搜最相似的 Top-3 历史黄金 SQL；
+        # 只要相似度 sim > 0.18，就把那条历史 SQL 涉及到的所有表（tables）各加 + sim * 9.0（多条相似 SQL 命中同一张表时可累加）。
+        # 把所有表的总分除以 total_p 归一化成和为 1.0 的 personalization 字典，连同边权重 edge_weight一起交给 PageRank 迭代，得出最终排名。
         schema = self.load_schema()
         if not schema:
             return []
@@ -955,7 +973,7 @@ class SchemaMapEngine:
         seed_set = set(seed_tables or [])
 
         # 纯硬编码加权还是太抽象了,得改
-        # 1. 离线 LLM 自动补齐“表画像”,让llm写业务描述和同义词
+        # 1. 离线 LLM 自动补齐“表画像”,让llm写业务描述和同义词.构建Table Card
         # 2. 向量相似度把每张表的“表名 + 字段 + 注释 + 同义词”拼成一张 Table Card 提前算好向量；
         # 在线收到 query 时算余弦相似度 cosine_sim(query, table_card)，直接拿这个相似度分数当 PageRank 的 personalization[t]
         # 3. 相似历史 Golden SQL 召回拿当前 query 去向量库搜历史上最像的 Top-3 黄金 SQL，看它们 FROM / JOIN 了哪几张表，直接给这几张表的 personalization 加超高权重

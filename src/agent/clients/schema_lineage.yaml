@@ -4,7 +4,7 @@
 # 2. 汇集三层探边漏斗成果: physical_fk / sql_ast_mined / inclusion_llm_verified
 # 3. 缓存离线 LLM 表画像 (table_profiles) 与历史黄金 SQL 问答对，用于灌入 Qdrant 向量库
 # ============================================================
-
+# 本地默认配的 Qdrant 是 :memory: 内存模式（QDRANT_LOCAL_PATH=":memory:"），服务一重启 Qdrant 内存就空了。 如果没存进 schema_lineage.yaml，每次重启服务都得重新给每张表调一遍 LLM 生成画像
 relationships:
 - left_table: dim_customers
   left_col: customer_id
